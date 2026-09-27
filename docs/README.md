@@ -310,6 +310,7 @@ functional set:
 | filesystems | `e2fsprogs`, `dosfstools`, `cryptsetup-libs`, `device-mapper-libs` |
 | kernel | `linux-lts` (Alpine 6.12.110), `mkinitfs`, `kmod`, BSP `6.18.53-ophub` on disk |
 | misc | `tzdata`, `ca-certificates-bundle`, `musl`, `libcrypto3`, `linux-firmware` |
+| GPU userspace (optional) | `mesa-gbm`, `mesa-egl`, `mesa-gles`, `mesa-dri-gallium`, `libgcc`, `font-dejavu` — only with `--with-mesa`, see "Optional GPU userspace" below |
 
 `dropbear` is the ssh server; the openssh client packages are kept for the
 `ssh`/`scp`/`sftp`/`ssh-keygen` CLIs (the `dropbear-dbclient`/`-ssh`/`-scp`
@@ -376,6 +377,11 @@ docker run --rm --privileged -v "$PWD":/work debian:trixie \
 docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
   bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/02-configure-rootfs.sh'
 
+# 2b. same stage with the OPTIONAL GPU userspace (mesa + libgcc + a font):
+#     build the image this way when the box runs a GL client on a DRM lease
+docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
+  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/02-configure-rootfs.sh --with-mesa'
+
 # 3. image: partition table, ext4, rootfs, u-boot at KiB 8  (needs host /dev for losetup)
 docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
   bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/03-build-image.sh'
@@ -390,6 +396,26 @@ tests/qemu-flash-mode.sh
 Inputs pulled once into the project tree: the minirootfs tarball, the ophub
 kernel release (`kernel/6.18.53.tar.gz` unpacked to `kernel/boot`,
 `kernel/dtbs`, `kernel/6.18.53/`), and `u-boot-sunxi-with-spl.bin`.
+
+### Optional GPU userspace
+
+`02-configure-rootfs.sh --with-mesa` (or `WITH_MESA=1` in the environment of
+that docker run) adds the userspace a GL client needs on this box:
+
+| Package | Why |
+|---|---|
+| `mesa-gbm` | `libgbm.so.1` — the buffer allocator a GBM client links; the only GL library that ends up in its `NEEDED` list |
+| `mesa-egl`, `mesa-gles` | `libEGL.so.1` / `libGLESv2.so.2`, dlopened at runtime, so they never appear in `NEEDED` and adding them later needs no rebuild |
+| `mesa-dri-gallium` | the panfrost DRI driver — without it EGL enumerates no device and the client silently renders on the CPU |
+| `libgcc` | `libgcc_s.so.1`: dynamically linked musl clients (built with the host cross toolchain) resolve their unwind symbols here. Alpine does not install it by default, and it fails late: `Error loading shared library libgcc_s.so.1` |
+| `font-dejavu` | a font FILE on disk; the image has no fontconfig and no fonts, so a UI toolkit has to be handed a `.ttf` path itself |
+
+Why it is opt-in rather than always on: the kernel half is already there (the BSP
+kernel ships panfrost and the Mali-G31 works without any of this), so an image
+that never runs a GL client does not need the mesa userspace at all. And a
+missing mesa does not look broken — a client that cannot get a GL context logs
+`Using Software renderer` and drops to the CPU, which reads as a slow UI rather
+than as a missing package.
 
 ### Bootloader
 

@@ -35,6 +35,36 @@ mount --rbind /sys "$ROOT/sys"
 echo "--- extra packages"
 chroot "$ROOT" /sbin/apk add --no-cache tzdata ifupdown-ng
 
+# --- optional GPU userspace (mesa) -----------------------------------------
+# Off by default. The BSP kernel already ships the panfrost driver for the
+# Mali-G31, so nothing here is needed to *boot*; this is the userspace a GL
+# client on a DRM lease needs (the sgc/Slint apps render through GBM/EGL):
+#
+#   mesa-gbm          libgbm.so.1 — the buffer allocator such a client links
+#   mesa-egl, -gles   libEGL.so.1 / libGLESv2.so.2 (dlopened at runtime, so
+#                     they never show up in the client's NEEDED list)
+#   mesa-dri-gallium  the panfrost DRI driver; without it EGL finds no device
+#   libgcc            libgcc_s.so.1 — dynamically linked musl clients built
+#                     with the host cross toolchain resolve their unwind
+#                     symbols here (Alpine does not install it by default)
+#   font-dejavu       UI toolkits need a font FILE on disk; the base image
+#                     carries none and has no fontconfig, so an app registers
+#                     a .ttf by path itself (e.g. /usr/share/fonts/dejavu)
+#
+# Enable with the `--with-mesa` argument or WITH_MESA=1 in the environment
+# (docker passes the variable through with -e; the flag needs no -e).
+with_mesa="${WITH_MESA:-0}"
+for arg in "$@"; do
+  [ "$arg" = "--with-mesa" ] && with_mesa=1
+done
+if [ "$with_mesa" = 1 ]; then
+  echo "--- GPU userspace (mesa, libgcc, font-dejavu)"
+  chroot "$ROOT" /sbin/apk add --no-cache \
+    mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libgcc font-dejavu
+else
+  echo "--- GPU userspace skipped (--with-mesa, or WITH_MESA=1 in the env)"
+fi
+
 echo "--- base config files"
 printf '%s\n' "$BOARD_HOSTNAME" > "$ROOT/etc/hostname"
 cat > "$ROOT/etc/hosts" <<EOF
