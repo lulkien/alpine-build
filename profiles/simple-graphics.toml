@@ -1,0 +1,46 @@
+# Profile: simple-graphics
+#
+# An image that runs a GL/DRM client on a display lease from the
+# simple-graphics-controller daemon: the common layer, the mesa userspace such a
+# client needs, and the daemon itself.
+#
+# Every key here is a delta, so changes to the common layer reach this profile
+# without being repeated. Select it with `--profile simple-graphics` or
+# PROFILE=simple-graphics in the environment.
+
+name = "simple-graphics"
+
+# Added on top of the common set.
+#
+#   mesa-gbm          libgbm.so.1 — the buffer allocator a GBM client links
+#   mesa-egl, -gles   libEGL.so.1 / libGLESv2.so.2, dlopened by the client at
+#                     runtime, so they never appear in its NEEDED list
+#   mesa-dri-gallium  the panfrost DRI driver; without it EGL enumerates no
+#                     device and the client silently renders on the CPU
+#   libgcc            libgcc_s.so.1 — dynamically linked musl clients resolve
+#                     their unwind symbols here; Alpine does not install it
+#   font-dejavu       a font FILE on disk: this image has no fontconfig and no
+#                     fonts, so a toolkit is handed a .ttf path itself
+apk_add = [
+    "mesa-gbm",
+    "mesa-egl",
+    "mesa-gles",
+    "mesa-dri-gallium",
+    "libgcc",
+    "font-dejavu",
+]
+
+# Subtracted from the merged set. linux-lts is the second kernel on this board
+# and exists only as a comparison/debug extlinux entry; a GL client never needs
+# it, and `apk upgrade` touching it is a known footgun here. Removing it drops
+# the module tree and the initramfs from the image.
+apk_remove = ["linux-lts"]
+
+# The init script has to be in the rootfs after the packages in `recipes` are
+# installed, or the build fails.
+services = ["default:simple-graphics-controller"]
+
+# Built from recipes/<name>.toml by scripts/05-build-recipes.sh. Each recipe pins
+# a git repo and a full commit sha; the build produces a .apk which stage 2
+# installs.
+recipes = ["simple-graphics-controller"]

@@ -41,19 +41,15 @@ echo "--- apk update"
 chroot "$ROOT" /sbin/apk update
 
 echo "--- apk add"
-# dropbear replaces openssh-server (same authorized_keys, key-only login).
-# openssh-client-default/-keygen stay for the ssh/scp/sftp, ssh-keygen CLIs.
+# Only what the BUILD needs, not what the image is: the image's own packages
+# (ssh server and clients, DHCP client, tzdata, dosfstools, alpine-conf,
+# linux-lts, the mesa userspace) come from the profile in stage 2.
+#
+# busybox-static and cpio feed the flash initramfs, e2fsprogs-extra provides the
+# resize2fs the growfs service runs, alpine-base is the rootfs floor. Removing
+# one of those does not produce a smaller image, it produces a broken build.
 chroot "$ROOT" /sbin/apk add --no-cache \
-  alpine-base linux-lts alpine-conf \
-  dropbear dropbear-openrc openssh-client-default openssh-keygen \
-  e2fsprogs e2fsprogs-extra dosfstools busybox-static cpio
-
-echo "--- installed kernel"
-chroot "$ROOT" /sbin/apk info -e linux-lts || true
-ls -lh "$ROOT/boot"
-
-echo "--- h618 devicetrees present"
-ls "$ROOT/boot/dtbs-lts/allwinner/" 2>/dev/null | grep h618 || true
+  alpine-base e2fsprogs e2fsprogs-extra busybox-static cpio
 
 cleanup
 echo "--- rootfs size"

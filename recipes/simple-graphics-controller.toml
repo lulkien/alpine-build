@@ -1,0 +1,98 @@
+# Recipe: simple-graphics-controller
+#
+# The resource daemon that leases DRM/fbdev display and input devices to clients
+# over the @sgc socket. Pure Rust, no C dependencies at build time, so it is the
+# recipe that proves the pipeline: the build chroot needs nothing beyond a Rust
+# toolchain (unlike the Slint client recipes, which need the slint fork and
+# therefore a rustc newer than the 1.87 that Alpine 3.22 ships).
+#
+# It is also the recipe that packages itself: the repository carries an APKBUILD,
+# and `apkbuild` hands the file layout, the dependencies and the metadata to it
+# instead of repeating them here. What this file still owns is the artifact,
+# because that APKBUILD packages a prebuilt binary (exactly as its cargo-deb
+# flavors do, with `cargo deb --no-build`): `build` produces one, abuild signs
+# and packages it.
+#
+# Field reference: docs/recipes.md. Validated by tools/buildcfg.py:
+#
+#   tools/buildcfg.py recipe show simple-graphics-controller
+#   tools/buildcfg.py recipe validate
+
+name = "simple-graphics-controller"
+version = "0.1.0"
+license = "Unlicense"
+maintainer = "lulkien <kien.luuhoang.arch@proton.me>"
+
+# https, not the ssh remote: the build chroot has no keys.
+repo = "https://github.com/sgc-project/simple-graphics-controller.git"
+
+# A full commit sha, never a branch: this is the head of the pull request that
+# adds the Alpine packaging (APKBUILD + packaging/openrc), which is what this
+# recipe now packages. Bump it to the merge commit on master once that lands -
+# the sha stays fetchable meanwhile, since GitHub keeps the pull request ref.
+ref = "32ed0ad81dd7e2b421b4d5809b63937165f2b54f"
+
+# Alpine packages installed in the build chroot before `build` runs.
+#
+#   gcc, musl-dev  the C linker and headers rustc needs to link
+#   binutils       strip, which this recipe runs itself (the APKBUILD sets
+#                  options="!strip": the artifact arrives already stripped)
+#   file           the APKBUILD's build() uses it to check the artifact is the
+#                  architecture being packaged and is statically linked
+#
+# No `rust` or `cargo`: see rust_toolchain below.
+#
+# abuild itself (and tar/gzip) is added by 05 when a recipe packages this way: it
+# is a property of the packaging path, not of this piece of software.
+makedepends = ["gcc", "musl-dev", "binutils", "file"]
+
+# Alpine v3.22 ships rustc 1.87. The daemon is edition 2024 and uses let-chains,
+# which became stable in 1.88, so the mirror toolchain cannot build it: 05 installs
+# this toolchain with rustup in the build chroot instead. 1.88 is the floor, not a
+# preference - raise it when the crate needs more.
+rust_toolchain = "1.88.0"
+
+# Alpine packages the built binaries need on the board. Empty: the crate links no
+# C library, and the binary is statically linked, so apk resolves nothing. The
+# profile's mesa packages are about the clients, not this daemon.
+depends = []
+
+# Sibling checkouts this build resolves by path. The crate declares
+#   simple-graphics-protocol = { version = "0.1", path = "../simple-graphics-protocol" }
+# and the path wins over the published version, so a lone clone of this
+# repository cannot build: Cargo.lock records that dependency with no source and
+# cargo goes looking for the directory. Each entry is '<repo>@<commit sha>' and
+# is fetched into src/ beside this recipe's own checkout - the same layout the
+# development machine has. Pinned for the same reason the main ref is.
+sources = [
+    "https://github.com/sgc-project/simple-graphics-protocol.git@2ed4c588a7e8a9113fa6e0830b3c54af4e747f5c",
+]
+
+# Runs in the checked-out source tree, with the chroot's toolchain on PATH.
+#
+# The APKBUILD packages $startdir/dist/simple-graphics-controller and nothing
+# else, so this is what has to exist when abuild runs: the release build, stripped
+# into dist/. No --target: the build is native, and a named triple would ask for a
+# target this toolchain does not carry by default. No crt-static either: rustc
+# links a musl target statically by default, and forcing it through RUSTFLAGS
+# breaks every proc-macro in the dependency graph (a proc-macro is a dylib; the
+# APKBUILD checks the artifact is "statically linked", so a dynamic build fails
+# there instead). --locked: the repository commits Cargo.lock, so nothing
+# re-resolves.
+#
+# CARGO_TARGET_..._LINKER: the crate's .cargo/config.toml names
+# aarch64-unknown-linux-musl-gcc as the linker for that triple, which is the
+# musl.cc cross toolchain a workstation cross-build uses. Here the build is native,
+# so the linker is the chroot's cc, and that name does not exist.
+build = """
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc cargo build --release --locked --features drm,input
+install -Dm755 target/release/simple-graphics-controller dist/simple-graphics-controller
+strip -s dist/simple-graphics-controller
+"""
+
+# The package's own definition, in the repository: it installs
+# /usr/bin/simple-graphics-controller, /etc/init.d/simple-graphics-controller and
+# /usr/share/licenses/simple-graphics-controller/LICENSE, and declares no runtime
+# dependencies. The service is installed but not enabled - enabling it is this
+# image's line in profiles/simple-graphics.toml, which is the Alpine convention.
+apkbuild = "APKBUILD"

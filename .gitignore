@@ -16,10 +16,24 @@ flash-initramfs/
 *.img
 *.img.sha256
 
+# Resolved build configuration (tools/buildcfg.py --emit env writes it here)
+build/
+
+# Recipe caches and packages (scripts/05: checkouts at the pinned commits, and
+# the .apk files it builds; the image is assembled from these, not committed)
+src/
+packages/
+
+# Python bytecode from tools/*.py
+__pycache__/
+
 # Generated device trees (merged/compiled during the build; sources are committed)
 board/*.dtbo
 board/*-ethfix.dtb
 board/x98h.dts
+
+# Repo-specific working files
+.hermes/
 
 # Editors
 *.swp

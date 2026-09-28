@@ -1,0 +1,83 @@
+# Common layer: what every profile starts from
+#
+# A profile is common.toml plus profiles/<name>.toml, both parsed by
+# scripts/lib/profile.sh and resolved into the final package, service and
+# recipe lists. A profile only states its difference: keys it omits are the
+# common ones, and its arrays add to them. `apk_remove` / `services_remove`
+# subtract from the merged result (removal wins over addition).
+#
+# Two rules the resolver enforces:
+#   - only the keys below exist; an unknown key fails the build with a line
+#     number instead of being silently ignored,
+#   - `common` is not a profile: it never builds an image on its own.
+#
+# This file is also where the image content currently hardcoded in the build
+# scripts belongs, so that there is one place describing an image:
+#
+#   apk_add    scripts/01-bootstrap-rootfs.sh:46-49 + 02-configure-rootfs.sh:36
+#   services   scripts/02-configure-rootfs.sh:100-107
+#
+# Deliberately NOT here: the packages the build itself needs rather than the
+# image — busybox-static and cpio feed the flash initramfs, e2fsprogs-extra
+# provides the resize2fs the growfs service runs, alpine-base is the rootfs
+# floor. Removing those does not produce a smaller image, it produces a broken
+# build, so they stay in scripts/01.
+
+name = "common"
+
+# Alpine packages from the v3.22 mirrors that every image carries.
+apk_add = [
+    "alpine-conf",
+    "linux-lts",
+    "dropbear",
+    "dropbear-openrc",
+    "openssh-client-default",
+    "openssh-keygen",
+    "tzdata",
+    "ifupdown-ng",
+    "dosfstools",
+]
+
+# Nothing removed from the common set by default. A profile that removes a
+# package the build asserts on (resize2fs, say) fails the build, which is the
+# point: the assertion names the path that would be missing.
+apk_remove = []
+
+# <runlevel>:<service>; a bare name means the default runlevel. growfs and
+# mdev-hotplug are board services installed by stage 2, not by a package.
+#
+# seedrng, not urandom: Alpine 3.22 has no /etc/init.d/urandom, and the previous
+# hardcoded list enabled service names with a silent `[ -x ]` guard, so a name
+# that did not exist was simply never enabled. The profile list is checked
+# against the image instead, which is how this was found.
+services = [
+    "boot:bootmisc",
+    "boot:devfs",
+    "boot:dmesg",
+    "boot:hwdrivers",
+    "boot:mdev",
+    "boot:modules",
+    "boot:root",
+    "boot:sysctl",
+    "boot:seedrng",
+    "boot:syslog",
+    "boot:swclock",
+    "boot:hostname",
+    "boot:growfs",
+    "boot:mdev-hotplug",
+    "default:networking",
+    "default:dropbear",
+    "default:crond",
+    "default:ntpd",
+    "default:local",
+]
+
+services_remove = []
+
+# Packages built from recipes/<name>.toml. The common layer builds none: only a
+# profile that runs locally built software names any.
+recipes = []
+
+# Alpine packages such a profile's binaries need at runtime beyond what the
+# recipes declare themselves. Additive only, like apk_add.
+runtime_apk_add = []

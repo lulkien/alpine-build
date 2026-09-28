@@ -298,8 +298,10 @@ Check on the board with `date`, `rc-service ntpd status`, `rc-status default`.
 
 ## Packages
 
-162 packages; roughly 90 of them are `linux-firmware-*` subpackages. The
-functional set:
+The base rootfs is built by `01` and carries only what the *build* needs;
+everything image-visible comes from the profile (see "Profiles" below). The
+`headless` image is about 160 packages, roughly 90 of them `linux-firmware-*`
+subpackages. The functional set:
 
 | Area | Packages |
 |---|---|
@@ -310,13 +312,14 @@ functional set:
 | filesystems | `e2fsprogs`, `dosfstools`, `cryptsetup-libs`, `device-mapper-libs` |
 | kernel | `linux-lts` (Alpine 6.12.110), `mkinitfs`, `kmod`, BSP `6.18.53-ophub` on disk |
 | misc | `tzdata`, `ca-certificates-bundle`, `musl`, `libcrypto3`, `linux-firmware` |
-| GPU userspace (optional) | `mesa-gbm`, `mesa-egl`, `mesa-gles`, `mesa-dri-gallium`, `libgcc`, `font-dejavu` — only with `--with-mesa`, see "Optional GPU userspace" below |
+| GPU userspace (`simple-graphics` profile) | `mesa-gbm`, `mesa-egl`, `mesa-gles`, `mesa-dri-gallium`, `libgcc`, `font-dejavu` — see "Profiles" below |
 
 `dropbear` is the ssh server; the openssh client packages are kept for the
 `ssh`/`scp`/`sftp`/`ssh-keygen` CLIs (the `dropbear-dbclient`/`-ssh`/`-scp`
 variants are not installed). No `dhcpcd`: busybox `udhcpc` is the DHCP client.
 Installed outside the package set: `/usr/sbin/ota-flash` (network reflash, see
-"OTA reflash over HTTP" below).
+"OTA reflash over HTTP" below) and `/etc/solovox/image-manifest` (what this image
+is: profile, packages, recipe commits — see "Profiles" below).
 
 Login: hostname `solovox`, user `root`, password locked (`/etc/shadow` `root:*`),
 key-only over ssh
@@ -361,28 +364,46 @@ Two things about it matter for the build:
 
 ## Build
 
-Five scripts; inputs are fetched and hash-verified first, then each stage runs
-through a throwaway container so the host needs no extra tooling — only
-`docker` and `qemu-aarch64` binfmt are required.
+One command does the whole thing:
+
+```bash
+bash build.sh                              # headless, the default profile
+bash build.sh --profile simple-graphics    # mesa userspace + the sgc daemon
+bash build.sh --clean --no-tests           # wipe the rootfs first, skip the checks
+```
+
+It runs `00` fetch/verify, the profile and recipe checks, `05` for the profile's
+recipes (packages from `recipes/`, skipped when the profile names none), then
+`01`, `02` and `03` through throwaway containers, and prints the image path, size
+and sha256. Roughly two minutes on a warm cache; a recipe that compiles adds its
+own build time.
+
+The stages below are the same thing spelled out, for running or debugging one of
+them on its own. Inputs are fetched and hash-verified first, then each stage runs
+through a throwaway container so the host needs no extra tooling — only `docker`
+and `qemu-aarch64` binfmt are required (plus `python3` for the profile/recipe
+checks and anything you run by hand).
 
 ```bash
 # 0. download + verify inputs (u-boot, minirootfs, ophub kernel release)
 bash scripts/00-fetch-inputs.sh
 
-# 1. Alpine aarch64 rootfs, native apk inside a qemu chroot
+# sanity check the profiles and recipes (host python3, no docker)
+tests/buildcfg.sh
+
+# 1. Alpine aarch64 rootfs: only what the build needs, native apk in a qemu chroot
 docker run --rm --privileged -v "$PWD":/work debian:trixie \
   bash /work/scripts/01-bootstrap-rootfs.sh
 
-# 2. board config, BSP kernel + modules, extlinux.conf, flash-mode initramfs
+# 2. profile packages + services, board config, BSP kernel + modules,
+#    extlinux.conf, flash-mode initramfs, /etc/solovox/image-manifest
+#    (python3 is needed here: tools/buildcfg.py resolves the profile)
+PROFILE=headless
 docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
-  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/02-configure-rootfs.sh'
+  bash -c "apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio python3 && bash /work/scripts/02-configure-rootfs.sh --profile $PROFILE"
 
-# 2b. same stage with the OPTIONAL GPU userspace (mesa + libgcc + a font):
-#     build the image this way when the box runs a GL client on a DRM lease
-docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
-  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/02-configure-rootfs.sh --with-mesa'
-
-# 3. image: partition table, ext4, rootfs, u-boot at KiB 8  (needs host /dev for losetup)
+# 3. image: partition table, ext4, rootfs, u-boot at KiB 8, and the profile
+#    assertions (needs host /dev for losetup)
 docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
   bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/03-build-image.sh'
 
@@ -397,12 +418,33 @@ Inputs pulled once into the project tree: the minirootfs tarball, the ophub
 kernel release (`kernel/6.18.53.tar.gz` unpacked to `kernel/boot`,
 `kernel/dtbs`, `kernel/6.18.53/`), and `u-boot-sunxi-with-spl.bin`.
 
-### Optional GPU userspace
+### Profiles
 
-`02-configure-rootfs.sh --with-mesa` (or `WITH_MESA=1` in the environment of
-that docker run) adds the userspace a GL client needs on this box:
+What an image contains is a profile, not a flag:
 
-| Package | Why |
+```
+profiles/common.toml          every image: ssh, DHCP client, tzdata, dosfstools,
+                              linux-lts, the boot/default service lists
+profiles/headless.toml        nothing on top of common (the default profile)
+profiles/simple-graphics.toml common + the mesa userspace + the sgc daemon
+```
+
+`tools/buildcfg.py` merges common with the chosen profile, subtracts what the
+profile removes (`apk_remove` of `linux-lts` in `simple-graphics`), and emits the
+resolved lists twice: as bash arrays into `build/profile.env` for stage 2 to
+install from, and as `/etc/solovox/image-manifest` inside the image, so a
+running box can say which profile it is and which commit each recipe came from.
+Stage 3 reads the same `build/profile.env` back and asserts the finished image
+against it: every package installed, every removal absent, every service shipped
+and enabled, and the `mainline` extlinux entry present only when `linux-lts`
+actually is. A profile is validated before any of that — unknown keys, a name
+that does not match the file, a removal that removes nothing, a service whose
+init script does not exist are all build errors (`tests/buildcfg.sh`).
+
+Software that is not in the Alpine mirrors is a recipe; see
+[docs/recipes.md](recipes.md).
+
+| Profile package | Why |
 |---|---|
 | `mesa-gbm` | `libgbm.so.1` — the buffer allocator a GBM client links; the only GL library that ends up in its `NEEDED` list |
 | `mesa-egl`, `mesa-gles` | `libEGL.so.1` / `libGLESv2.so.2`, dlopened at runtime, so they never appear in `NEEDED` and adding them later needs no rebuild |
@@ -410,10 +452,10 @@ that docker run) adds the userspace a GL client needs on this box:
 | `libgcc` | `libgcc_s.so.1`: dynamically linked musl clients (built with the host cross toolchain) resolve their unwind symbols here. Alpine does not install it by default, and it fails late: `Error loading shared library libgcc_s.so.1` |
 | `font-dejavu` | a font FILE on disk; the image has no fontconfig and no fonts, so a UI toolkit has to be handed a `.ttf` path itself |
 
-Why it is opt-in rather than always on: the kernel half is already there (the BSP
-kernel ships panfrost and the Mali-G31 works without any of this), so an image
-that never runs a GL client does not need the mesa userspace at all. And a
-missing mesa does not look broken — a client that cannot get a GL context logs
+Why the mesa userspace is a profile rather than always on: the kernel half is
+already there (the BSP kernel ships panfrost and the Mali-G31 works without any
+of this), so an image that never runs a GL client does not need it. And a missing
+mesa does not look broken — a client that cannot get a GL context logs
 `Using Software renderer` and drops to the CPU, which reads as a slow UI rather
 than as a missing package.
 

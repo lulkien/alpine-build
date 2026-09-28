@@ -1,23 +1,40 @@
 #!/bin/bash
-# Configure the bootstrapped Alpine rootfs for the X98H and drop in the
+# Configure the bootstrapped Alpine rootfs for the Z8Pro and drop in the
 # Allwinner BSP kernel (6.18.53-ophub) that the box is known to boot with.
+#
+# What goes into the image is decided by a profile: profiles/common.toml plus
+# profiles/<name>.toml, resolved by tools/buildcfg.py into bash arrays, which is
+# what this script installs from and enables. --profile defaults to headless.
+# The resolved lists are kept in build/profile.env so 03 can assert the finished
+# image against exactly what this stage installed.
 #
 # Kernel choice: mainline has no node or driver for the X98H's wired port
 # (sun50i-h616.dtsi defines only emac0; the X98H PHY hangs off emac1/RMII in
 # the vendor DTB), so the BSP kernel + BSP DTB is used for hardware support.
-# The Alpine linux-lts kernel stays on disk as a second extlinux entry.
+# Alpine linux-lts is an ordinary profile package, not a kernel choice.
 #
 # Runs as root inside a throwaway Debian container; writes only into /work.
 set -euo pipefail
 
 WORK=/work
 ROOT="$WORK/rootfs"
+BUILDDIR="$WORK/build"
+PACKAGES_DIR="$WORK/packages"
 KREL=6.18.53-ophub
 KDIR=6.18.53
 BOARD_HOSTNAME=solovox
 ROOT_PARTUUID=abcd1234-01
 TZ_NAME=Asia/Ho_Chi_Minh
 SSH_PUBKEY_FILE="$WORK/board/authorized_keys"
+PROFILE="${PROFILE:-headless}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --profile) PROFILE="$2"; shift 2 ;;
+    --profile=*) PROFILE="${1#*=}"; shift ;;
+    *) echo "unknown option: $1 (usage: $0 [--profile <name>])" >&2; exit 1 ;;
+  esac
+done
 
 [ -d "$ROOT" ] || { echo "rootfs missing: run 01 first" >&2; exit 1; }
 
@@ -32,37 +49,57 @@ mount -t proc proc "$ROOT/proc"
 mount --rbind /dev "$ROOT/dev"
 mount --rbind /sys "$ROOT/sys"
 
-echo "--- extra packages"
-chroot "$ROOT" /sbin/apk add --no-cache tzdata ifupdown-ng
+echo "--- profile: $PROFILE"
+# tools/buildcfg.py merges profiles/common.toml with the profile and emits bash
+# arrays: the profile decides the packages, the services and the recipes, and
+# nothing below re-states them.
+mkdir -p "$BUILDDIR"
+python3 "$WORK/tools/buildcfg.py" profile show "$PROFILE" --emit env > "$BUILDDIR/profile.env"
+# shellcheck disable=SC1090
+. "$BUILDDIR/profile.env"
+printf '    %s packages, %s recipes, %s services\n' \
+  "${#PROFILE_APK_ADD[@]}" "${#PROFILE_RECIPES[@]}" "${#PROFILE_SERVICES[@]}"
 
-# --- optional GPU userspace (mesa) -----------------------------------------
-# Off by default. The BSP kernel already ships the panfrost driver for the
-# Mali-G31, so nothing here is needed to *boot*; this is the userspace a GL
-# client on a DRM lease needs (the sgc/Slint apps render through GBM/EGL):
-#
-#   mesa-gbm          libgbm.so.1 — the buffer allocator such a client links
-#   mesa-egl, -gles   libEGL.so.1 / libGLESv2.so.2 (dlopened at runtime, so
-#                     they never show up in the client's NEEDED list)
-#   mesa-dri-gallium  the panfrost DRI driver; without it EGL finds no device
-#   libgcc            libgcc_s.so.1 — dynamically linked musl clients built
-#                     with the host cross toolchain resolve their unwind
-#                     symbols here (Alpine does not install it by default)
-#   font-dejavu       UI toolkits need a font FILE on disk; the base image
-#                     carries none and has no fontconfig, so an app registers
-#                     a .ttf by path itself (e.g. /usr/share/fonts/dejavu)
-#
-# Enable with the `--with-mesa` argument or WITH_MESA=1 in the environment
-# (docker passes the variable through with -e; the flag needs no -e).
-with_mesa="${WITH_MESA:-0}"
-for arg in "$@"; do
-  [ "$arg" = "--with-mesa" ] && with_mesa=1
-done
-if [ "$with_mesa" = 1 ]; then
-  echo "--- GPU userspace (mesa, libgcc, font-dejavu)"
-  chroot "$ROOT" /sbin/apk add --no-cache \
-    mesa-gbm mesa-egl mesa-gles mesa-dri-gallium libgcc font-dejavu
-else
-  echo "--- GPU userspace skipped (--with-mesa, or WITH_MESA=1 in the env)"
+echo "--- profile packages"
+chroot "$ROOT" /sbin/apk add --no-cache "${PROFILE_APK_ADD[@]}"
+
+if [ "${#PROFILE_RUNTIME_APK_ADD[@]}" -gt 0 ]; then
+  echo "--- runtime packages for the recipe-built ones"
+  chroot "$ROOT" /sbin/apk add --no-cache "${PROFILE_RUNTIME_APK_ADD[@]}"
+fi
+
+if [ "${#PROFILE_RECIPES[@]}" -gt 0 ]; then
+  echo "--- recipe packages (built by 05, not from the mirrors)"
+  # The packages are ours and are signed with the build key, so apk only needs
+  # that key's public half: copying it in is what lets the install below run
+  # without --allow-untrusted. Copied into the rootfs first: the chroot cannot
+  # see /work.
+  if [ ! -d "$WORK/build/keys" ]; then
+    echo "FAIL: no signing key in $WORK/build/keys" >&2
+    echo "      run scripts/05-build-recipes.sh --profile $PROFILE first" >&2
+    exit 1
+  fi
+  install -d -m 755 "$ROOT/etc/apk/keys"
+  for pub in "$WORK/build/keys"/*.rsa.pub; do
+    [ -f "$pub" ] || continue
+    install -m 644 "$pub" "$ROOT/etc/apk/keys/$(basename "$pub")"
+    echo "    trusted key: $(basename "$pub")"
+  done
+  for recipe in "${PROFILE_RECIPES[@]}"; do
+    apk_file=""
+    for candidate in "$PACKAGES_DIR/${recipe}"_[0-9]*.apk; do
+      [ -f "$candidate" ] && apk_file="$candidate"
+    done
+    if [ -z "$apk_file" ]; then
+      echo "FAIL: no built package for recipe '$recipe' in $PACKAGES_DIR" >&2
+      echo "      run scripts/05-build-recipes.sh --profile $PROFILE first" >&2
+      exit 1
+    fi
+    install -m 644 "$apk_file" "$ROOT/tmp/$(basename "$apk_file")"
+    chroot "$ROOT" /sbin/apk add --no-cache "/tmp/$(basename "$apk_file")"
+    rm -f "$ROOT/tmp/$(basename "$apk_file")"
+    echo "    $recipe <- $(basename "$apk_file")"
+  done
 fi
 
 echo "--- base config files"
@@ -97,14 +134,9 @@ EOF
 mkdir -p "$ROOT/root/.ssh"
 install -m 600 "$SSH_PUBKEY_FILE" "$ROOT/root/.ssh/authorized_keys"
 
-echo "--- enable services"
-for svc in bootmisc devfs dmesg hwdrivers mdev modules root sysctl urandom syslog; do
-  [ -x "$ROOT/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "$ROOT/etc/runlevels/boot/$svc"
-done
-for svc in networking dropbear crond ntpd local; do
-  [ -x "$ROOT/etc/init.d/$svc" ] && ln -sf "/etc/init.d/$svc" "$ROOT/etc/runlevels/default/$svc"
-done
-[ -x "$ROOT/etc/init.d/hostname" ] && ln -sf /etc/init.d/hostname "$ROOT/etc/runlevels/boot/hostname"
+# Services are enabled further down, from the profile's list, once the board's
+# own init scripts are in place: every entry is checked against the image, so an
+# entry whose script is missing fails the build instead of the boot.
 
 echo "--- clock (no RTC on this board)"
 # Without this the clock sits at 1970 until someone sets it by hand, and every
@@ -138,9 +170,15 @@ fdtoverlay -i "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" \
            "$WORK/board/sun50i-h618-z8pro.dtbo"
 install -m 644 "$WORK/board/sun50i-h618-z8pro.dtbo" "$ROOT/boot/dtbs/allwinner/overlay/"
 # The merge must actually have landed: PHY reg 0x00 on the emac1 MDIO bus.
-dtc -I dtb -O dts "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" 2>/dev/null \
-  | sed -n '/ethernet-phy@1/,/};/p' | grep -q "reg = <0x00>" \
-  || { echo "ethfix overlay did not apply (PHY reg still 1)" >&2; exit 1; }
+# Captured, not piped into `grep -q`: grep exits at the first match, the writer
+# then dies of SIGPIPE, and with pipefail that reads as a failed check. The DTS
+# dump is bigger than a pipe buffer, so this race is real, not theoretical.
+phy_node=$(dtc -I dtb -O dts "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" 2>/dev/null \
+  | sed -n '/ethernet-phy@1/,/};/p')
+case "$phy_node" in
+  *"reg = <0x00>"*) ;;
+  *) echo "ethfix overlay did not apply (PHY reg still 1)" >&2; exit 1 ;;
+esac
 echo "    merged: $(ls -l "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" | awk '{print $5}') bytes"
 
 echo "--- BSP modules into /lib/modules"
@@ -202,11 +240,49 @@ mknod -m 666 "$IR/dev/null" c 1 3
 ( cd "$IR" && find . | cpio -o -H newc --quiet | gzip -9 ) > "$ROOT/boot/flash-initramfs.gz" \
   || { echo "FAIL: cannot build flash-initramfs.gz"; exit 1; }
 ls -lh "$ROOT/boot/flash-initramfs.gz"
-# cpio -t prints names without the leading "./".
+# cpio -t prints names without the leading ".".
+# Listed once into a variable: `gzip | cpio | grep -q` would end the pipeline at
+# the first match and kill the writers with SIGPIPE, which pipefail then reports
+# as the check itself failing. The listing is wrapped in newlines so an entry can
+# be matched in any position, not just first or last.
+ir_listing=$'\n'$(gzip -dc "$ROOT/boot/flash-initramfs.gz" | cpio -t 2>/dev/null)$'\n'
 for entry in init bin/busybox bin/bmap-write udhcpc.script; do
-  gzip -dc "$ROOT/boot/flash-initramfs.gz" | cpio -t 2>/dev/null | grep -qx "$entry" ||
-    { echo "FAIL: $entry missing from flash-initramfs.gz"; exit 1; }
+  case "$ir_listing" in
+    *$'\n'"$entry"$'\n'*) ;;
+    *) echo "FAIL: $entry missing from flash-initramfs.gz" >&2; exit 1 ;;
+  esac
 done
+
+echo "--- services from the profile"
+# An entry is <runlevel>:<service>; a bare name means the default runlevel. Its
+# init script has to exist by now: an image that enables a service it does not
+# ship is broken at boot, and the build is where that is still cheap to catch.
+for entry in "${PROFILE_SERVICES[@]}"; do
+  level=${entry%%:*}
+  svc=${entry#*:}
+  if [ "$level" = "$entry" ]; then
+    level=default
+  fi
+  if [ ! -x "$ROOT/etc/init.d/$svc" ]; then
+    echo "FAIL: profile '$PROFILE' enables service '$svc' but /etc/init.d/$svc is not in the image" >&2
+    exit 1
+  fi
+  mkdir -p "$ROOT/etc/runlevels/$level"
+  ln -sf "/etc/init.d/$svc" "$ROOT/etc/runlevels/$level/$svc"
+done
+ls "$ROOT/etc/runlevels/boot" "$ROOT/etc/runlevels/default"
+
+echo "--- image manifest"
+# What this image is: the profile, the packages it asked for, what it removed,
+# the commit each recipe was built from, and the versions that actually landed.
+# Read on the board at /etc/solovox/image-manifest.
+install -d -m 755 "$ROOT/etc/solovox"
+{
+  python3 "$WORK/tools/buildcfg.py" profile show "$PROFILE" --emit manifest
+  printf 'built: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'packages:\n'
+  chroot "$ROOT" /sbin/apk info -v | sed 's/^/  /'
+} > "$ROOT/etc/solovox/image-manifest"
 
 echo "--- extlinux.conf"
 cat > "$ROOT/boot/extlinux/extlinux.conf" <<EOF
@@ -240,17 +316,33 @@ LABEL debug
   FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
   APPEND root=/dev/mmcblk0p1 rw rootfstype=ext4 ignore_loglevel loglevel=8 panic=15 console=ttyS0,115200 console=tty0 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
 
+EOF
+
+# The mainline entry exists only when linux-lts is in the image: a profile is
+# allowed to remove it (the graphics one does), and a label pointing at a kernel
+# that is not on the disk is a boot failure waiting for the next TIMEOUT.
+mainline=0
+for pkg in "${PROFILE_APK_ADD[@]}"; do
+  if [ "$pkg" = linux-lts ]; then mainline=1; fi
+done
+if [ "$mainline" = 1 ]; then
+cat >> "$ROOT/boot/extlinux/extlinux.conf" <<EOF
+
 LABEL mainline
   MENU LABEL Alpine (mainline linux-lts, no wired ethernet)
   LINUX /boot/vmlinuz-lts
   INITRD /boot/initramfs-lts
   FDT /boot/dtbs-lts/allwinner/sun50i-h618-transpeed-8k618-t.dtb
   APPEND root=PARTUUID=$ROOT_PARTUUID rw rootfstype=ext4 rootwait console=ttyS0,115200 console=tty0 panic=30 max_loop=128 net.ifnames=0
+EOF
+fi
 
 # Flash mode: RAM-only initramfs that downloads an image and writes it to the
 # disk. ota-flash rewrites this APPEND with ota_* parameters before setting
 # DEFAULT to flash, and restores extlinux.conf.bak if the flash aborts before
 # the first byte is written.
+cat >> "$ROOT/boot/extlinux/extlinux.conf" <<EOF
+
 LABEL flash
   MENU LABEL Flash mode (downloads and writes an image, no OS running)
   LINUX /boot/vmlinuz-$KREL
