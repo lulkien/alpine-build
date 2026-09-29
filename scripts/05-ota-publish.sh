@@ -16,7 +16,7 @@
 # derives the sidecars by stripping the ".gz", so the four files must stay
 # together in the release folder.
 #
-# Usage: scripts/04-ota-publish.sh [image-file] [--local] [--flat] [--host HOST] [--port N]
+# Usage: scripts/05-ota-publish.sh [image-file] [--local] [--flat] [--host HOST] [--port N]
 #   --local        do not touch the NAS: serve image/ from this host instead
 #   --flat         publish straight into the release base, no release folder
 #   --host HOST    URL host for the board (default: $OTA_URL_HOST or 10.21.50.12)
@@ -51,7 +51,7 @@ done
 
 if [ -z "$IMG" ]; then
   IMG=$(ls -1t image/*.img 2>/dev/null | head -1 || true)
-  [ -n "$IMG" ] || { echo "no image/*.img found: run scripts/03-build-image.sh first" >&2; exit 1; }
+  [ -n "$IMG" ] || { echo "no image/*.img found: run scripts/04-build-image.sh first" >&2; exit 1; }
 fi
 [ -f "$IMG" ] || { echo "no such image: $IMG" >&2; exit 1; }
 

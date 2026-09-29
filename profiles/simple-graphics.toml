@@ -40,7 +40,7 @@ apk_remove = ["linux-lts"]
 # installed, or the build fails.
 services = ["default:simple-graphics-controller"]
 
-# Built from recipes/<name>.toml by scripts/05-build-recipes.sh. Each recipe pins
+# Built from recipes/<name>.toml by scripts/01-build-recipes.sh. Each recipe pins
 # a git repo and a full commit sha; the build produces a .apk which stage 2
 # installs.
 recipes = ["simple-graphics-controller"]

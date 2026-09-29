@@ -1,0 +1,34 @@
+# Platform: Solovox Z8Pro — an X98H clone (Allwinner H618, 2-4 GB LPDDR, SD/eMMC).
+#
+# Only what is specific to this machine. Anything here overrides
+# board/common/board.toml. The vendor name in the files (x98h) is the family the
+# box is a clone of, not the board name.
+
+hostname = "solovox"
+
+# Kernel: the vendor BSP tree is required, not a preference. sun50i-h616.dtsi has
+# no emac1 node and dwmac-sun8i cannot drive H616 EMAC200, so this box's wired
+# port is dead on mainline. `kernel` is the ophub asset, `kernel_release` the
+# version it reports inside the image, `kernel_sha256` what stage 00 verifies.
+kernel = "6.18.53"
+kernel_release = "6.18.53-ophub"
+kernel_url = "https://github.com/ophub/kernel/releases/download/kernel_stable/6.18.53.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+
+# u-boot for this box, from ophub's allwinner tree.
+uboot_url = "https://raw.githubusercontent.com/ophub/u-boot/main/u-boot/allwinner/x98h/u-boot-sunxi-with-spl.bin"
+uboot_file = "u-boot-sunxi-with-spl.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+
+# Devicetree. `dtb` comes with the kernel (installed to /boot/dtbs/allwinner/);
+# `overlays` are ours, compiled in the build and merged into `boot_dtb`, which is
+# what extlinux boots. The vendor originals sit in devicetree/vendor/.
+dtb = "sun50i-h618-x98h.dtb"
+overlays = ["devicetree/sun50i-h618-z8pro-ethfix.dtso"]
+boot_dtb = "sun50i-h618-z8pro-ethfix.dtb"
+
+# The merge has to have landed or the board boots with a dead port, which reads as
+# a hardware fault: after merging, the decompiled node below must contain this
+# text. It is the clone's PHY strapping (MDIO address 0, vendor DTB says 1).
+merge_check_node = "ethernet-phy@1"
+merge_check_text = "reg = <0x00>"

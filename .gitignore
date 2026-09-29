@@ -27,11 +27,6 @@ packages/
 # Python bytecode from tools/*.py
 __pycache__/
 
-# Generated device trees (merged/compiled during the build; sources are committed)
-board/*.dtbo
-board/*-ethfix.dtb
-board/x98h.dts
-
 # Repo-specific working files
 .hermes/
 

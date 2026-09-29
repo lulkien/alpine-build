@@ -1,0 +1,41 @@
+# The board layer: what the build needs to know about the *machine*, as data.
+#
+# board/common/board.toml is the shared layer and board/platform/<name>/board.toml
+# is one machine, merged the same way profiles/common.toml and a profile are: the
+# platform file overrides what differs. tools/buildcfg.py resolves the pair into
+# build/board.env, which the stage scripts source, and into the board lines of
+# /etc/solovox/image-manifest.
+#
+# This file holds what every platform would otherwise repeat. The machine's name
+# is its directory name, not a key.
+#
+# Runtime files are conventions, not keys:
+#
+#   board/common/runtime/root/       copied into the image rootfs, each file's
+#                                    path mirroring where it lands on the board
+#   board/common/runtime/initramfs/  copied into the flash-mode initramfs, same idea
+#
+# A platform may add its own runtime/{root,initramfs} tree the same way; both are
+# copied, the platform's after the common one.
+
+# The Alpine release the rootfs comes from.
+alpine_branch = "v3.22"
+alpine_release = "3.22.6"
+alpine_mirror = "https://dl-cdn.alpinelinux.org/alpine"
+# verified by stage 00; a new Alpine release means a new value here
+alpine_minirootfs_sha256 = "821565fa8f3953eefd12497b166b4b50add2f7c57fb312e75862f5867e06fefe"
+
+# Image identity. The file name is assembled from these plus the machine and the
+# kernel version: <image_prefix>-<machine>-<alpine_release>-<kernel>.
+image_prefix = "alpine"
+image_size_mb = 4096
+disk_id = "abcd1234"
+root_partuuid = "abcd1234-01"
+rootfs_uuid = "9f1c7a3e-5b21-4f8d-9a1c-7b2d4e6f8a90"
+
+# Locale for the image's clock. A platform can override it.
+timezone = "Asia/Ho_Chi_Minh"
+
+# Files under a runtime/root tree that must not be world-readable. Git tracks only
+# the executable bit, so modes that matter are named here rather than guessed.
+private_files = ["root/.ssh/authorized_keys"]

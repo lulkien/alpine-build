@@ -57,14 +57,14 @@ install -Dm644 bin/fixture-tool "\$DESTDIR/etc/fixture.conf"
 """
 EOF
 
-echo "--- 05: fetch the pinned commit, install, package"
+echo "--- 04: fetch the pinned commit, install, package"
 # the fixture is mounted inside the workspace, because the recipe hooks run in
 # the build chroot where only /work is visible
 docker run --rm --privileged -v /dev:/dev -v "$REPO":/work -v "$SCRATCH":/work/build/fixture alpine:3.22 \
   sh -c "apk add --no-cache bash abuild git tar gzip openssl python3 >/dev/null &&
     RECIPES_DIR=/work/build/fixture/recipes SRC_DIR=/work/build/fixture/src \
     BUILD_DIR=/work/build/fixture/build PACKAGES_DIR=/work/build/fixture/packages \
-    bash /work/scripts/05-build-recipes.sh --recipe fixture-tool" 2>&1 |
+    bash /work/scripts/01-build-recipes.sh --recipe fixture-tool" 2>&1 |
   grep -E "^(===|    |/work)" | tail -14
 
 APK="$SCRATCH/packages/fixture-tool_1.0.0-r0.apk"

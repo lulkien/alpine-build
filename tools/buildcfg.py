@@ -37,6 +37,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROFILES_DIR = Path(os.environ.get("PROFILES_DIR", REPO_ROOT / "profiles"))
 RECIPES_DIR = Path(os.environ.get("RECIPES_DIR", REPO_ROOT / "recipes"))
+BOARDS_DIR = Path(os.environ.get("BOARDS_DIR", REPO_ROOT / "board"))
 
 PROFILE_LIST_KEYS = (
     "apk_add",
@@ -64,7 +65,55 @@ RECIPE_STRING_KEYS = (
 RECIPE_KEYS = {*RECIPE_LIST_KEYS, *RECIPE_STRING_KEYS}
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 APK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9+._-]*$")
+
+# The board layer: board/common/board.toml holds what every platform shares and
+# board/platform/<name>/board.toml holds one machine, which is the same
+# common-plus-delta shape as profiles. These keys are the machine-specific facts
+# the stages used to hardcode: the kernel and u-boot to fetch, the devicetree to
+# merge, and the image's identity.
+BOARD_LIST_KEYS = ("overlays", "private_files")
+BOARD_STRING_KEYS = (
+    "hostname",
+    "kernel",
+    "kernel_release",
+    "kernel_url",
+    "kernel_sha256",
+    "uboot_url",
+    "uboot_file",
+    "uboot_sha256",
+    "dtb",
+    "boot_dtb",
+    "merge_check_node",
+    "merge_check_text",
+    "alpine_branch",
+    "alpine_release",
+    "alpine_mirror",
+    "alpine_minirootfs_sha256",
+    "image_prefix",
+    "timezone",
+    "disk_id",
+    "root_partuuid",
+    "rootfs_uuid",
+)
+BOARD_INT_KEYS = ("image_size_mb",)
+BOARD_KEYS = {*BOARD_LIST_KEYS, *BOARD_STRING_KEYS, *BOARD_INT_KEYS}
+# What a platform (or the common layer) has to set for the build to be possible.
+BOARD_REQUIRED = (
+    "hostname",
+    "kernel",
+    "kernel_release",
+    "kernel_url",
+    "kernel_sha256",
+    "uboot_url",
+    "uboot_file",
+    "uboot_sha256",
+    "dtb",
+    "boot_dtb",
+    "alpine_release",
+    "alpine_minirootfs_sha256",
+)
 # a sibling checkout a recipe's build needs: <repo>@<commit sha>
 SOURCE_RE = re.compile(r"^(?P<repo>(?:https|file)://\S+)@(?P<ref>[0-9a-f]{40})$")
 # a rustup toolchain name: the value reaches a shell command in 05, so it is
@@ -296,6 +345,181 @@ def load_recipe(name: str) -> dict:
     }
 
 
+def available_platforms() -> list[str]:
+    root = BOARDS_DIR / "platform"
+    if not root.is_dir():
+        return []
+    return sorted(p.name for p in root.iterdir() if (p / "board.toml").is_file())
+
+
+def runtime_trees(name: str, kind: str) -> list[str]:
+    """Runtime trees a platform ships, workspace-relative: the common one, plus
+    the platform's own when it has one (platform-specific runtime files)."""
+    trees = [f"board/common/runtime/{kind}"]
+    if (BOARDS_DIR / "platform" / name / "runtime" / kind).is_dir():
+        trees.append(f"board/platform/{name}/runtime/{kind}")
+    return trees
+
+
+def load_board(name: str) -> dict:
+    """Merge board/common/board.toml with board/platform/<name>/board.toml."""
+    if not name:
+        raise ConfigError("no platform given (--board <name>)")
+    common_path = BOARDS_DIR / "common" / "board.toml"
+    platform_dir = BOARDS_DIR / "platform" / name
+    path = platform_dir / "board.toml"
+    if not path.is_file():
+        raise ConfigError(f"no such platform: board/platform/{name}/board.toml")
+
+    common = read_toml(common_path)
+    platform = read_toml(path)
+    check_keys(common_path, common, BOARD_KEYS)
+    check_keys(path, platform, BOARD_KEYS)
+
+    merged = {**common, **platform}
+
+    def source(key: str) -> Path:
+        """The file a merged value came from, for error messages."""
+        return path if key in platform else common_path
+
+    for key in BOARD_REQUIRED:
+        string(source(key), merged, key, required=True)
+    for key in BOARD_STRING_KEYS:
+        string(path, merged, key)
+
+    for key in ("kernel_url", "uboot_url", "alpine_mirror"):
+        value = string(path, merged, key)
+        if value and not value.startswith("https://"):
+            raise ConfigError(
+                f"{path}: {key} must be an https:// URL ({value!r}); the build"
+                " containers carry no ssh keys"
+            )
+    for key in BOARD_STRING_KEYS:
+        value = string(path, merged, key)
+        if value and key.endswith("_sha256") and not SHA256_RE.match(value):
+            raise ConfigError(
+                f"{path}: {key} must be a 64-character hex sha256 ({value!r})"
+            )
+    for key in ("dtb", "boot_dtb"):
+        value = string(path, merged, key)
+        if value and not value.endswith(".dtb"):
+            raise ConfigError(f"{path}: {key} must name a .dtb ({value!r})")
+
+    size = merged.get("image_size_mb", 0)
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        raise ConfigError(
+            f"{path}: image_size_mb must be a positive integer number of MiB"
+            f" (got {size!r})"
+        )
+
+    overlays = string_list(path, merged, "overlays")
+    for overlay in overlays:
+        if not overlay.endswith(".dtso"):
+            raise ConfigError(
+                f"{path}: overlays entry {overlay!r} must be a .dtso source (the"
+                " compiled .dtbo is a build artifact)"
+            )
+        if not (platform_dir / overlay).is_file():
+            raise ConfigError(
+                f"{path}: overlays lists {overlay!r}, which is not in"
+                f" board/platform/{name}/"
+            )
+
+    roots = runtime_trees(name, "root")
+    private = string_list(path, merged, "private_files")
+    for item in private:
+        if not any((BOARDS_DIR.parent / tree / item).is_file() for tree in roots):
+            raise ConfigError(
+                f"{path}: private_files lists {item!r}, which no runtime/root tree"
+                f" has ({', '.join(roots)})"
+            )
+
+    parts = [
+        string(path, merged, "image_prefix"),
+        name,
+        string(path, merged, "alpine_release"),
+        string(path, merged, "kernel"),
+    ]
+    image_name = "-".join(p for p in parts if p)
+
+    spec = {
+        "platform": name,
+        "machine": name,
+        "image_name": image_name,
+        "dir": f"board/platform/{name}",
+        "devicetree_dir": f"board/platform/{name}/devicetree",
+        "runtime_root": roots,
+        "runtime_initramfs": runtime_trees(name, "initramfs"),
+        "overlays": overlays,
+        "private_files": private,
+        "image_size_mb": size,
+    }
+    spec.update({key: string(path, merged, key) for key in BOARD_STRING_KEYS})
+    return spec
+
+
+def emit_text_board(spec: dict) -> str:
+    lines = [f"board: {spec['machine']}  (image {spec['image_name']})"]
+    for key in BOARD_STRING_KEYS:
+        lines.append(f"{key}: {spec[key] or '(none)'}")
+    lines.append(f"image_size_mb: {spec['image_size_mb']}")
+    for key in ("overlays", "private_files", "runtime_root", "runtime_initramfs"):
+        lines.append(f"{key} ({len(spec[key])}):")
+        lines.extend(f"  {item}" for item in spec[key]) if spec[key] else lines.append("  (none)")
+    return "\n".join(lines) + "\n"
+
+
+def sh_quote(value: str) -> str:
+    """Quote a value for sourcing (and for eval): the emitted file is bash."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def emit_env_board(spec: dict) -> str:
+    """The board half of the shell contract: values the stage scripts source.
+
+    Paths are workspace-relative (the containers mount the workspace at /work).
+    Values are quoted, so `eval "$(tools/buildcfg.py board show --emit env)"`
+    works as well as writing the file: stage 00 runs on the host, where build/
+    may be owned by root from an earlier container run.
+    """
+    lines = [
+        "# generated by tools/buildcfg.py - do not edit",
+        f"BOARD_MACHINE={sh_quote(spec['machine'])}",
+        f"BOARD_IMAGE_NAME={sh_quote(spec['image_name'])}",
+        f"BOARD_IMAGE_SIZE_MB={spec['image_size_mb']}",
+        f"BOARD_DIR={sh_quote(spec['dir'])}",
+        f"BOARD_DEVICETREE_DIR={sh_quote(spec['devicetree_dir'])}",
+    ]
+    for key in BOARD_STRING_KEYS:
+        lines.append(f"BOARD_{key.upper()}={sh_quote(spec[key])}")
+    for key, var in (
+        ("overlays", "BOARD_OVERLAYS"),
+        ("private_files", "BOARD_PRIVATE_FILES"),
+        ("runtime_root", "BOARD_RUNTIME_ROOTS"),
+        ("runtime_initramfs", "BOARD_RUNTIME_INITRAMFS_DIRS"),
+    ):
+        quoted = " ".join(sh_quote(item) for item in spec[key])
+        lines.append(f"{var}=({quoted})")
+    return "\n".join(lines) + "\n"
+
+
+def emit_manifest_board(spec: dict) -> str:
+    """The board lines of /etc/solovox/image-manifest: which machine, and which
+    kernel and u-boot it was assembled from (inputs nothing else records)."""
+    return "\n".join(
+        [
+            f"board: {spec['machine']}  hostname {spec['hostname']}",
+            f"  kernel: {spec['kernel_release']} {spec['kernel_url']}",
+            f"  kernel_sha256: {spec['kernel_sha256']}",
+            f"  u-boot: {spec['uboot_file']} {spec['uboot_url']}",
+            "  devicetree: "
+            + spec["dtb"]
+            + (" + " + " ".join(spec["overlays"]) if spec["overlays"] else "")
+            + f" -> {spec['boot_dtb']}",
+        ]
+    ) + "\n"
+
+
 def available_profiles() -> list[str]:
     return sorted(
         p.stem for p in PROFILES_DIR.glob("*.toml") if p.stem != "common"
@@ -400,6 +624,13 @@ def main(argv: list[str] | None = None) -> int:
     p_recipe.add_argument("names", nargs="*")
     p_recipe.add_argument("--emit", choices=("text", "json"), default="text")
 
+    p_board = sub.add_parser("board", help="board/platform/<name>/board.toml")
+    p_board.add_argument("action", choices=("show", "list", "validate"))
+    p_board.add_argument("name", nargs="?")
+    p_board.add_argument(
+        "--emit", choices=("text", "json", "env", "manifest"), default="text"
+    )
+
     args = parser.parse_args(argv)
 
     try:
@@ -417,6 +648,40 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write(emit_manifest_profile(spec))
             else:
                 sys.stdout.write(emit_text_profile(spec))
+            return 0
+
+        if args.command == "board":
+            if args.action == "list":
+                for name in available_platforms():
+                    print(name)
+                return 0
+            name = args.name
+            if not name:
+                platforms = available_platforms()
+                if args.action == "validate":
+                    if not platforms:
+                        raise ConfigError(f"no platforms in {BOARDS_DIR}/platform")
+                    for platform in platforms:
+                        load_board(platform)
+                    print(f"all {len(platforms)} platform(s) validate")
+                    return 0
+                if len(platforms) != 1:
+                    raise ConfigError(
+                        "give a platform name; available: "
+                        + ", ".join(platforms or ["none"])
+                    )
+                name = platforms[0]
+            spec = load_board(name)
+            if args.emit == "json":
+                print(json.dumps(spec, indent=2, sort_keys=True))
+            elif args.emit == "env":
+                sys.stdout.write(emit_env_board(spec))
+            elif args.emit == "manifest":
+                sys.stdout.write(emit_manifest_board(spec))
+            else:
+                sys.stdout.write(emit_text_board(spec))
+            if args.action == "validate":
+                print(f"board {name}: ok")
             return 0
 
         if args.action == "list":

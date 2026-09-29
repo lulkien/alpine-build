@@ -134,7 +134,7 @@ and silently, so nothing is logged.
 
 Two pieces ship in the image:
 
-- `/usr/sbin/ota-flash` (source `board/ota-flash`) arms the next boot.
+- `/usr/sbin/ota-flash` (source `board/runtime/ota-flash`) arms the next boot.
 - a `flash` extlinux label and `/boot/flash-initramfs.gz` are flash mode itself.
 
 `ota-flash <url>` writes nothing. It checks the URL and its sidecars, bakes the
@@ -146,7 +146,7 @@ the point of the design. Writing the boot medium from the running OS put ext4
 writeback inside the image being written, and the flasher's own executables were
 read back from the blocks `dd` was overwriting.
 
-Flash mode sequence (`board/flash-init`): read the `ota_*` parameters from the
+Flash mode sequence (`board/runtime/flash-init`): read the `ota_*` parameters from the
 kernel command line, bring `eth0` up over DHCP, fetch the bmap, stream the `.gz`
 through gzip writing only the mapped ranges, verify every range by reading it
 back, check the u-boot magic at KiB 8, reboot. The freshly written image has
@@ -165,7 +165,7 @@ Recovery, and the two outcomes are different:
 ```
 # on this host: compress, build the bmap, write the sidecars, publish a release
 # folder to the NAS and verify it over HTTP
-scripts/04-ota-publish.sh
+scripts/05-ota-publish.sh
 
 # on the board: check the source and the metadata, change nothing
 ota-flash http://10.21.50.12:8080/latest/alpine-solovox-z8pro-3.22.6-6.18.53.img.gz --test
@@ -180,7 +180,7 @@ ota-flash --cancel
 
 ### Release folders
 
-One build, one folder. `scripts/04-ota-publish.sh` writes it under
+One build, one folder. `scripts/05-ota-publish.sh` writes it under
 `/srv/remotemount/OTA` on the NAS — an NFS mount from `10.21.50.10`, so releases
 live on the storage host rather than in a home directory:
 
@@ -298,7 +298,7 @@ Check on the board with `date`, `rc-service ntpd status`, `rc-status default`.
 
 ## Packages
 
-The base rootfs is built by `01` and carries only what the *build* needs;
+The base rootfs is built by `02` and carries only what the *build* needs;
 everything image-visible comes from the profile (see "Profiles" below). The
 `headless` image is about 160 packages, roughly 90 of them `linux-firmware-*`
 subpackages. The functional set:
@@ -330,6 +330,17 @@ login (uncomment the `ttyS0` line in `/etc/inittab` for UART).
 
 ## Z8Pro / X98H-clone Ethernet overlay
 
+### What is in `board/`
+
+The board layer lives here: `board/common/` is what every machine shares (the
+Alpine release, the image naming and IDs, and the runtime files that ship in the
+image), and `board/platform/<name>/` is one machine (its kernel and u-boot pins,
+its devicetree, its hostname). `tools/buildcfg.py` resolves the pair into
+`build/board.env` for the stage scripts, and `build.sh --board <name>` picks the
+machine. The runtime trees mirror their destinations, so a file's path in
+`board/common/runtime/root/` is its path on the board; compiled devicetrees go to
+`build/devicetree/`, never into the tree. See [docs/board.md](board.md).
+
 The board's PHY answers at MDIO address 0, while the vendor DTB places it at
 address 1 on emac1's MDIO bus — the link stays down until that is corrected.
 Source overlay:
@@ -351,14 +362,14 @@ Two things about it matter for the build:
 - That file is **decompiled DTS text**, not a compiled blob (`file` calls it
   "Device Tree File (v1), ASCII text"), and dtc will not recompile it as-is:
   its bare `/fragment@0 {}` root form fails with `syntax error`. The canonical
-  `/plugin/;` form is kept at `board/sun50i-h618-z8pro-overlay.dts` with
+  `/plugin/;` form is kept at `board/devicetree/sun50i-h618-z8pro-ethfix.dtso` with
   identical semantics.
 - The overlay is **merged at build time** (`dtc -@` then `fdtoverlay`) into
   `/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb`, because this image boots
   with no initramfs and u-boot's `FDTOVERLAYS` support is not assumed. The
   compiled `.dtbo` still ships in `/boot/dtbs/allwinner/overlay/` for other
   boot paths.
-- `02-configure-rootfs.sh` asserts the merge landed (PHY `reg = <0x00>` in the
+- `03-configure-rootfs.sh` asserts the merge landed (PHY `reg = <0x00>` in the
   merged blob) and fails the build otherwise. The unpatched DTB remains
   selectable as the `bsp-nofix` label for A/B comparison.
 
@@ -372,11 +383,11 @@ bash build.sh --profile simple-graphics    # mesa userspace + the sgc daemon
 bash build.sh --clean --no-tests           # wipe the rootfs first, skip the checks
 ```
 
-It runs `00` fetch/verify, the profile and recipe checks, `05` for the profile's
-recipes (packages from `recipes/`, skipped when the profile names none), then
-`01`, `02` and `03` through throwaway containers, and prints the image path, size
-and sha256. Roughly two minutes on a warm cache; a recipe that compiles adds its
-own build time.
+It runs `00` fetch/verify, the board, profile and recipe checks, `01` for the
+profile's recipes (packages from `recipes/`, skipped when the profile names none),
+then `02`, `03` and `04` through throwaway containers, and prints the image path,
+size and sha256. Roughly two minutes on a warm cache; a recipe that compiles adds
+its own build time.
 
 The stages below are the same thing spelled out, for running or debugging one of
 them on its own. Inputs are fetched and hash-verified first, then each stage runs
@@ -393,22 +404,22 @@ tests/buildcfg.sh
 
 # 1. Alpine aarch64 rootfs: only what the build needs, native apk in a qemu chroot
 docker run --rm --privileged -v "$PWD":/work debian:trixie \
-  bash /work/scripts/01-bootstrap-rootfs.sh
+  bash /work/scripts/02-bootstrap-rootfs.sh
 
 # 2. profile packages + services, board config, BSP kernel + modules,
 #    extlinux.conf, flash-mode initramfs, /etc/solovox/image-manifest
 #    (python3 is needed here: tools/buildcfg.py resolves the profile)
 PROFILE=headless
 docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
-  bash -c "apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio python3 && bash /work/scripts/02-configure-rootfs.sh --profile $PROFILE"
+  bash -c "apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio python3 && bash /work/scripts/03-configure-rootfs.sh --profile $PROFILE"
 
 # 3. image: partition table, ext4, rootfs, u-boot at KiB 8, and the profile
 #    assertions (needs host /dev for losetup)
 docker run --rm --privileged -v /dev:/dev -v "$PWD":/work debian:trixie \
-  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/03-build-image.sh'
+  bash -c 'apt-get update -qq && apt-get install -y -qq rsync e2fsprogs fdisk dosfstools device-tree-compiler cpio && bash /work/scripts/04-build-image.sh'
 
 # 4. publish a release folder to the NAS: .gz, .sha256, .size, .bmap, SHA256SUMS
-scripts/04-ota-publish.sh
+scripts/05-ota-publish.sh
 
 # 5. optional: exercise flash mode end to end without the board
 tests/qemu-flash-mode.sh

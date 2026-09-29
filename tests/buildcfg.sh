@@ -94,7 +94,7 @@ assert_match "recipe names the rustc the mirror does not have" "$recipe" '^rust_
 
 rjson=$(python3 "$TOOL" recipe show simple-graphics-controller --emit json)
 assert_match "recipe json: the apkbuild path is emitted" "$rjson" '"apkbuild": "APKBUILD"'
-# the json is what 05 reads, so it has to agree with the file rather than with a
+# the json is what 04 reads, so it has to agree with the file rather than with a
 # sha hardcoded here that goes stale the next time the pin is bumped
 toml_ref=$(sed -n 's/^ref = "\([0-9a-f]\{40\}\)"$/\1/p' "$REPO/recipes/simple-graphics-controller.toml")
 assert_match "recipe json: ref is the pinned commit" "$rjson" "\"ref\": \"$toml_ref\""
@@ -197,6 +197,193 @@ expect_fail "a profile naming a missing recipe is refused" "$PFIX" "$RFIX" \
 expect_fail "the common layer is not a profile" "$PFIX" "$RFIX" "'common' is the shared" \
   profile show common
 expect_fail "a missing profile is reported" "$PFIX" "$RFIX" 'no such file' profile show nosuch
+
+echo "--- board"
+
+assert_eq "board list" "solovox-z8pro" "$(python3 "$TOOL" board list)"
+python3 "$TOOL" board validate >/dev/null && ok "the real platform validates" ||
+  bad "the real platform validates"
+
+board=$(python3 "$TOOL" board show)
+assert_match "board: the image name is derived from the layer" "$board" \
+  '^board: solovox-z8pro  (image alpine-solovox-z8pro-3.22.6-6.18.53)$'
+assert_match "board: the kernel asset is data" "$board" '^kernel: 6\.18\.53$'
+assert_match "board: the vendor dtb is data" "$board" '^dtb: sun50i-h618-x98h\.dtb$'
+assert_match "board: the tree the image boots is data" "$board" '^boot_dtb: sun50i-h618-z8pro-ethfix\.dtb$'
+assert_match "board: the overlay source is in the platform dir" "$board" \
+  '^  devicetree/sun50i-h618-z8pro-ethfix\.dtso$'
+assert_match "board: the runtime tree is named" "$board" '^  board/common/runtime/root$'
+assert_match "board: the key is not world-readable" "$board" '^  root/\.ssh/authorized_keys$'
+
+# the stage scripts source (or eval) this text: prove it is valid bash and that a
+# value containing spaces survives the round trip
+env_out=$(python3 "$TOOL" board show --emit env)
+# shellcheck disable=SC1090
+eval "$env_out"
+assert_eq "board env: machine" "solovox-z8pro" "$BOARD_MACHINE"
+assert_eq "board env: image name" "alpine-solovox-z8pro-3.22.6-6.18.53" "$BOARD_IMAGE_NAME"
+assert_eq "board env: kernel release" "6.18.53-ophub" "$BOARD_KERNEL_RELEASE"
+assert_eq "board env: one overlay" "devicetree/sun50i-h618-z8pro-ethfix.dtso" "${BOARD_OVERLAYS[0]}"
+assert_eq "board env: one private file" "root/.ssh/authorized_keys" "${BOARD_PRIVATE_FILES[0]}"
+assert_eq "board env: the merge check text keeps its spaces" "reg = <0x00>" "$BOARD_MERGE_CHECK_TEXT"
+
+assert_match "board json: the runtime roots are listed" \
+  "$(python3 "$TOOL" board show --emit json)" '"runtime_root"'
+assert_match "board manifest: the kernel pin is recorded" \
+  "$(python3 "$TOOL" board show --emit manifest)" '^  kernel: 6\.18\.53-ophub https://'
+
+echo "--- board fixtures"
+
+BFIX="$SCRATCH/boards"
+mkdir -p "$BFIX/common" "$BFIX/platform/fake/devicetree"
+cat > "$BFIX/common/board.toml" <<'EOF'
+alpine_branch = "v3.22"
+alpine_release = "3.22.6"
+alpine_mirror = "https://example.invalid/alpine"
+alpine_minirootfs_sha256 = "821565fa8f3953eefd12497b166b4b50add2f7c57fb312e75862f5867e06fefe"
+image_prefix = "alpine"
+image_size_mb = 4096
+disk_id = "abcd1234"
+root_partuuid = "abcd1234-01"
+rootfs_uuid = "9f1c7a3e-5b21-4f8d-9a1c-7b2d4e6f8a90"
+timezone = "UTC"
+private_files = []
+EOF
+fake_platform() { # rewrites the platform file with "$1" replacing its body
+  cat > "$BFIX/platform/fake/board.toml" <<EOF
+$1
+EOF
+}
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "https://example.invalid/kernel.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"
+overlays = []
+merge_check_node = "node@0"
+merge_check_text = "reg = <0x0>"'
+BOARDS_DIR="$BFIX" python3 "$TOOL" board validate >/dev/null &&
+  ok "a second platform validates" || bad "a second platform validates"
+
+# expect_fail_board <description> <pattern> <args...>
+expect_fail_board() {
+  local what=$1 pattern=$2
+  shift 2
+  local out
+  if out=$(BOARDS_DIR="$BFIX" python3 "$TOOL" "$@" 2>&1); then
+    bad "$what (succeeded: $out)"
+    return
+  fi
+  if grep -q -- "$pattern" <<<"$out"; then ok "$what"; else bad "$what (message: $out)"; fi
+}
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"'
+expect_fail_board "a platform without the required keys is refused" "is required" \
+  board show fake
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "https://example.invalid/kernel.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"
+overlays = []
+merge_check_node = "node@0"
+merge_check_text = "reg = <0x0>"
+bogus = "1"'
+expect_fail_board "an unknown board key is refused" "unknown key" board show fake
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "http://example.invalid/kernel.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"'
+expect_fail_board "a non-https board URL is refused" "must be an https:// URL" board show fake
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "https://example.invalid/kernel.tar.gz"
+kernel_sha256 = "not-a-sha"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"'
+expect_fail_board "a bad board checksum is refused" "must be a 64-character hex sha256" \
+  board show fake
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "https://example.invalid/kernel.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"
+image_size_mb = "4096"'
+expect_fail_board "a non-integer image size is refused" "positive integer" board show fake
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "https://example.invalid/kernel.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"
+overlays = ["devicetree/thing.dtbo"]'
+expect_fail_board "a compiled overlay in the source list is refused" "must be a .dtso source" \
+  board show fake
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "https://example.invalid/kernel.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"
+overlays = ["devicetree/missing.dtso"]'
+expect_fail_board "an overlay that is not in the platform dir is refused" "is not in" \
+  board show fake
+
+fake_platform 'hostname = "fake"
+kernel = "1.0"
+kernel_release = "1.0-fake"
+kernel_url = "https://example.invalid/kernel.tar.gz"
+kernel_sha256 = "269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7"
+uboot_url = "https://example.invalid/uboot.bin"
+uboot_file = "uboot.bin"
+uboot_sha256 = "4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96"
+dtb = "fake.dtb"
+boot_dtb = "fake-fixed.dtb"
+private_files = ["etc/shadow"]'
+expect_fail_board "a private file no runtime tree has is refused" "no runtime/root tree" \
+  board show fake
+
+expect_fail_board "a missing platform is reported" "no such platform" board show nosuch
 
 echo "--- recipe rejections"
 

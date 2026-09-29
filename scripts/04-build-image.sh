@@ -12,14 +12,25 @@ set -euo pipefail
 WORK=/work
 ROOT="$WORK/rootfs"
 BUILDDIR="$WORK/build"
-UBOOT="$WORK/u-boot-sunxi-with-spl.bin"
 IMGDIR="$WORK/image"
-KREL=6.18.53-ophub
-NAME=alpine-solovox-z8pro-3.22.6-6.18.53
+
+# Board data: build/board.env is written by 03 (and by build.sh before any
+# container runs). The image name, its size, the disk and filesystem IDs, the
+# kernel release and the devicetree file names all come from there - this stage
+# names none of them itself.
+[ -f "$BUILDDIR/board.env" ] || {
+  echo "build/board.env missing: run scripts/03-configure-rootfs.sh first" >&2
+  exit 1
+}
+# shellcheck disable=SC1090
+. "$BUILDDIR/board.env"
+UBOOT="$WORK/$BOARD_UBOOT_FILE"
+KREL="$BOARD_KERNEL_RELEASE"
+NAME="$BOARD_IMAGE_NAME"
 IMG="$IMGDIR/$NAME.img"
-SIZE_MB="${SIZE_MB:-4096}"
-DISK_ID=abcd1234
-ROOTFS_UUID=9f1c7a3e-5b21-4f8d-9a1c-7b2d4e6f8a90
+SIZE_MB="${SIZE_MB:-$BOARD_IMAGE_SIZE_MB}"
+DISK_ID="$BOARD_DISK_ID"
+ROOTFS_UUID="$BOARD_ROOTFS_UUID"
 LOOP=""
 MOUNTED=0
 
@@ -27,7 +38,7 @@ MOUNTED=0
 # installed. Reading it back is what lets this stage assert the finished image
 # against the same lists, instead of a second hardcoded copy of them.
 if [ ! -f "$BUILDDIR/profile.env" ]; then
-  echo "build/profile.env missing: run scripts/02-configure-rootfs.sh first" >&2
+  echo "build/profile.env missing: run scripts/03-configure-rootfs.sh first" >&2
   exit 1
 fi
 # shellcheck disable=SC1090
@@ -39,7 +50,7 @@ if [ "$PROFILE_NAME" != headless ]; then
   IMG="$IMGDIR/$NAME.img"
 fi
 
-[ -d "$ROOT" ] || { echo "rootfs missing: run 01/02 first" >&2; exit 1; }
+[ -d "$ROOT" ] || { echo "rootfs missing: run 02/03 first" >&2; exit 1; }
 [ -f "$UBOOT" ] || { echo "u-boot image missing: $UBOOT" >&2; exit 1; }
 
 cleanup() {
@@ -94,11 +105,35 @@ mount -o ro "$P1" /mnt/target
 MOUNTED=1
 echo "--- boot tree on image"
 ls -l /mnt/target/boot /mnt/target/boot/extlinux
-# Structural paths only: what the profile brought is asserted below, against the
-# profile's own lists, so this list cannot drift from it.
-for chk in "/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" "/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" "/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo" "/boot/extlinux/extlinux.conf" "/sbin/init" "/usr/sbin/ota-flash" "/bin/busybox.static" "/boot/flash-initramfs.gz"; do
+# Structural paths only, and the board's names come from build/board.env: what the
+# profile brought is asserted below against the profile's own lists, so neither
+# list can drift from the files it describes.
+CHECKS=("/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/$BOARD_DTB"
+        "/boot/dtbs/allwinner/$BOARD_BOOT_DTB" "/boot/extlinux/extlinux.conf"
+        "/sbin/init" "/bin/busybox.static" "/boot/flash-initramfs.gz")
+for overlay in "${BOARD_OVERLAYS[@]}"; do
+  CHECKS+=("/boot/dtbs/allwinner/overlay/$(basename "${overlay%.dtso}").dtbo")
+done
+for chk in "${CHECKS[@]}"; do
   # -L as well: /sbin/init is an absolute symlink and does not resolve on the host
   [ -e "/mnt/target$chk" ] || [ -L "/mnt/target$chk" ] || { echo "MISSING on image: $chk" >&2; exit 1; }
+done
+# Everything the runtime trees carry has to be at the same path in the image: the
+# trees mirror the target, so no file has to be listed here by name.
+for tree in "${BOARD_RUNTIME_ROOTS[@]}"; do
+  while IFS= read -r rel; do
+    [ -e "/mnt/target/$rel" ] || [ -L "/mnt/target/$rel" ] ||
+      { echo "MISSING on image: /$rel (from $tree)" >&2; exit 1; }
+  done < <(cd "$WORK/$tree" && find . \( -type f -o -type l \) -printf '%P\n')
+done
+# The private files are the ones whose mode matters beyond git's executable bit:
+# an authorized_keys that is not 0600 and root-owned is a key sshd/dropbear
+# refuses, and the failure looks like the key itself being wrong.
+for item in "${BOARD_PRIVATE_FILES[@]}"; do
+  read -r mode owner group <<<"$(stat -c '%a %u %g' "/mnt/target/$item")"
+  [ "$mode" = 600 ] || { echo "FAIL: /$item is mode $mode on the image, expected 600" >&2; exit 1; }
+  [ "$owner" = 0 ] && [ "$group" = 0 ] ||
+    { echo "FAIL: /$item is owned by $owner:$group on the image, expected 0:0" >&2; exit 1; }
 done
 # openssh-server must not be present: dropbear is the ssh server here
 if [ -e /mnt/target/usr/sbin/sshd ]; then
@@ -106,7 +141,7 @@ if [ -e /mnt/target/usr/sbin/sshd ]; then
   exit 1
 fi
 
-echo "--- profile assertions (from build/profile.env, written by 02)"
+echo "--- profile assertions (from build/profile.env, written by 03)"
 INSTALLED_DB=/mnt/target/lib/apk/db/installed
 if [ ! -f "$INSTALLED_DB" ]; then
   echo "FAIL: $INSTALLED_DB missing on the image" >&2
@@ -167,7 +202,15 @@ if ! grep -qx "profile: $PROFILE_NAME" /mnt/target/etc/solovox/image-manifest; t
   echo "FAIL: the image manifest does not name profile '$PROFILE_NAME'" >&2
   exit 1
 fi
-echo "    profile '$PROFILE_NAME': ${#PROFILE_APK_ADD[@]} packages installed, ${#PROFILE_APK_REMOVE[@]} removed, ${#PROFILE_RECIPES[@]} recipes, ${#PROFILE_SERVICES[@]} services enabled"
+if ! grep -qx "board: $BOARD_MACHINE  hostname $BOARD_HOSTNAME" /mnt/target/etc/solovox/image-manifest; then
+  echo "FAIL: the image manifest does not name board '$BOARD_MACHINE'" >&2
+  exit 1
+fi
+if ! grep -q "^  kernel: $KREL " /mnt/target/etc/solovox/image-manifest; then
+  echo "FAIL: the image manifest does not record kernel '$KREL'" >&2
+  exit 1
+fi
+echo "    board '$BOARD_MACHINE' (kernel $KREL): ${#PROFILE_APK_ADD[@]} packages installed, ${#PROFILE_APK_REMOVE[@]} removed, ${#PROFILE_RECIPES[@]} recipes, ${#PROFILE_SERVICES[@]} services enabled"
 echo "--- required paths present"
 grep -q '^LABEL debug$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: debug label missing from extlinux.conf"; exit 1; }
 grep -q '^LABEL flash$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: flash label missing from extlinux.conf"; exit 1; }

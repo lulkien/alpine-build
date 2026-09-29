@@ -11,9 +11,18 @@ set -euo pipefail
 
 WORK=/work
 ROOT="$WORK/rootfs"
-BRANCH=v3.22
-RELEASE=3.22.6
-MIRROR=https://dl-cdn.alpinelinux.org/alpine
+# The Alpine release is board data (board/common/board.toml). build.sh resolved it
+# into build/board.env before this container started; this container has no
+# python3, so the file is a hard requirement here.
+[ -f "$WORK/build/board.env" ] || {
+  echo "build/board.env missing: run build.sh (or scripts/00-fetch-inputs.sh) first" >&2
+  exit 1
+}
+# shellcheck disable=SC1091
+. "$WORK/build/board.env"
+BRANCH="$BOARD_ALPINE_BRANCH"
+RELEASE="$BOARD_ALPINE_RELEASE"
+MIRROR="$BOARD_ALPINE_MIRROR"
 TARBALL=alpine-minirootfs-${RELEASE}-aarch64.tar.gz
 
 mkdir -p "$ROOT"

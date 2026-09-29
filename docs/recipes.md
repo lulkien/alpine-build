@@ -2,7 +2,7 @@
 
 A recipe describes one piece of software that is not in the Alpine mirrors: where
 its source comes from, which commit of it, how to build it, and what to install
-into the image. `scripts/05-build-recipes.sh` builds the recipes a profile names
+into the image. `scripts/01-build-recipes.sh` builds the recipes a profile names
 and turns each one into a signed Alpine package.
 
 ```
@@ -10,7 +10,7 @@ recipes/simple-graphics-controller.toml    one recipe, one file
 profiles/simple-graphics.toml              names it: recipes = [ "..." ]
 tools/buildcfg.py                          validates and resolves both
 tools/mkapk.sh                             DESTDIR tree -> signed .apk
-scripts/05-build-recipes.sh                fetch, build in a chroot, package
+scripts/01-build-recipes.sh                fetch, build in a chroot, package
 tests/buildcfg.sh                          format checks, no board required
 tests/recipe-build.sh                      the whole recipe path, offline
 ```
@@ -39,7 +39,7 @@ Hooks are multi-line TOML strings. They are shell, run with `set -e`, in the
 checked-out source tree. `install` also has `DESTDIR` set to the empty file tree
 that becomes the package, so paths are written as
 `"$DESTDIR/usr/bin/program"` and never touch the build host. Avoid double quotes
-in a hook: 05 passes it to `sh -c "…"`, so single quotes are the safe ones.
+in a hook: 01 passes it to `sh -c "…"`, so single quotes are the safe ones.
 
 Three rules are enforced because breaking them costs an image, not a test:
 
@@ -61,9 +61,9 @@ into a signed `.apk`.
 
 `apkbuild` is for software that already packages itself. The repository's own
 APKBUILD owns the file layout, the runtime dependencies and the metadata, so the
-image stops keeping a second copy of them that drifts. 05 installs `abuild` in the
+image stops keeping a second copy of them that drifts. 01 installs `abuild` in the
 build chroot, hands it the build key (signing key in `$HOME/.abuild`, public half
-in `/etc/apk/keys`, the same pair stage 02 trusts in the image) and runs
+in `/etc/apk/keys`, the same pair stage 03 trusts in the image) and runs
 
 ```
 abuild -F -d -P <build/abuild-out/<name>>
@@ -72,7 +72,7 @@ abuild -F -d -P <build/abuild-out/<name>>
 `-F` because root is the only user in the chroot; `-d` because the dependency
 check insists on an implicit `build-base` and these packages compile nothing
 on their own. The `.apk` is copied out to `packages/<name>_<version>-r0.apk`, so
-stage 02 sees the same flat directory either way, and abuild's index and working
+stage 03 sees the same flat directory either way, and abuild's index and working
 directory stay in `build/abuild-out/`.
 
 What that means for a recipe: with `apkbuild`, `build` still has to produce
@@ -125,7 +125,7 @@ uses let-chains (stable in 1.88) and the Slint fork declares
 rust_toolchain = "1.88.0"
 ```
 
-05 then installs it with rustup inside the chroot — the Alpine `rustup` package
+01 then installs it with rustup inside the chroot — the Alpine `rustup` package
 ships only `rustup-init`, so the first toolchain is installed by running that,
 with `HOME=/root` deciding where it lives — and runs the recipe's `build` hook
 with `~/.cargo/bin` on `PATH` and that toolchain as the default. The chroot is a
@@ -177,14 +177,14 @@ tools/buildcfg.py recipe show simple-graphics-controller
 
 # build every recipe the profile names into packages/ (Alpine container: the
 # packer uses abuild's tools)
-scripts/05-build-recipes.sh --profile simple-graphics
+scripts/01-build-recipes.sh --profile simple-graphics
 
 # then the image, which installs them and records the commits
 bash build.sh --profile simple-graphics
 ```
 
-`build.sh` runs 05 for profiles that name recipes, so the two commands above are
-one in practice. 05 keeps its caches under the workspace, all reusable:
+`build.sh` runs 01 for profiles that name recipes, so the two commands above are
+one in practice. 01 keeps its caches under the workspace, all reusable:
 
 ```
 src/<name>/            the checkout at the recipe's ref
@@ -207,7 +207,7 @@ packages/              the built .apk files
 
 ## Package naming
 
-A recipe becomes `<name>_<version>-r0.apk`, arch `aarch64`, installed by stage 02
+A recipe becomes `<name>_<version>-r0.apk`, arch `aarch64`, installed by stage 03
 from the build's own `packages/` directory. Alpine packages rather than files
 copied into the rootfs: ownership and modes come from the package, `apk info`/
 `apk del` work on the board, and dependency metadata travels with it.
@@ -222,8 +222,8 @@ streams, in this order:
 payload               the data stream, one sha1 per file
 ```
 
-The key pair lives in `build/keys/` (gitignored, generated once by 05) and stage
-02 copies the public half into the image's `/etc/apk/keys`, so the packages
+The key pair lives in `build/keys/` (gitignored, generated once by 01) and stage
+03 copies the public half into the image's `/etc/apk/keys`, so the packages
 install as **trusted** — no `--allow-untrusted` anywhere.
 
 Two load-bearing details, both found by testing against apk instead of reading

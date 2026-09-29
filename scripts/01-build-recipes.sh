@@ -1,8 +1,8 @@
 #!/bin/bash
 # Build the recipes a profile names into signed Alpine packages.
 #
-#   scripts/05-build-recipes.sh --profile simple-graphics
-#   scripts/05-build-recipes.sh --recipe simple-graphics-controller --force
+#   scripts/01-build-recipes.sh --profile simple-graphics
+#   scripts/01-build-recipes.sh --recipe simple-graphics-controller --force
 #
 # Runs inside an Alpine container (it needs abuild's tools either way). For each
 # recipe: fetch the pinned commit (or reuse the cached checkout), install its
@@ -22,12 +22,12 @@
 #   build/destdir/<name>/ what a recipe installed (the package's file tree)
 #   build/abuild-out/<name>/ abuild's own output dir (apk + index) for one recipe
 #   build/keys/          the signing key pair, generated once, never committed
-#   packages/            the built .apk files, installed by stage 02
+#   packages/            the built .apk files, installed by stage 03
 #
-# The signing public key is what makes 02 able to install these without
-# --allow-untrusted: 02 copies build/keys/*.pub into the image's /etc/apk/keys.
+# The signing public key is what makes 03 able to install these without
+# --allow-untrusted: 03 copies build/keys/*.pub into the image's /etc/apk/keys.
 #
-# Usage: scripts/05-build-recipes.sh --profile NAME | --recipe NAME... [options]
+# Usage: scripts/01-build-recipes.sh --profile NAME | --recipe NAME... [options]
 #   --profile NAME   build every recipe the profile names (from buildcfg.py)
 #   --recipe NAME    build one recipe (repeatable); default: the profile's
 #   --force          rebuild even if the package already exists
@@ -193,7 +193,7 @@ fi
 
 # abuild signs with the single key in $HOME/.abuild. The public half has to be
 # trusted where the package is verified (the chroot's index step) and where it is
-# installed (stage 02 copies the same file into the image's /etc/apk/keys), so
+# installed (stage 03 copies the same file into the image's /etc/apk/keys), so
 # the one build key goes into both places.
 if [ -n "$ABUILD_RECIPES" ]; then
   log "signing key into the chroot for: $ABUILD_RECIPES"
@@ -289,7 +289,7 @@ for json in "$BUILD_DIR"/*.json; do
   if [ -n "$apkbuild" ]; then
     # The upstream APKBUILD owns the file layout, the dependencies and the
     # metadata. abuild wants its own repository directory - it writes the .apk
-    # and an index there - which is kept out of packages/ so stage 02 keeps
+    # and an index there - which is kept out of packages/ so stage 03 keeps
     # seeing a flat directory of .apk files.
     #
     # -F: abuild refuses to run as root otherwise, and in the chroot root is the
@@ -298,7 +298,7 @@ for json in "$BUILD_DIR"/*.json; do
     # the build hook above produced). PACKAGER carries the recipe's maintainer
     # into the package metadata. PACKAGER_PRIVKEY: abuild looks for a key named
     # by its config or that variable, not for "the one .rsa in ~/.abuild", and
-    # this is the build key stage 02 trusts in the image.
+    # this is the build key stage 03 trusts in the image.
     log "$name: package with $apkbuild (abuild)"
     ABUILD_OUT="$BUILD_DIR/abuild-out/$name"
     rm -rf "$ABUILD_OUT"
@@ -333,7 +333,7 @@ log "done"
 ls -l "$PACKAGES_DIR"
 cat <<EOF
 
-Packages are installed by stage 02, which copies $KEYDIR/$KEY_NAME into the
+Packages are installed by stage 03, which copies $KEYDIR/$KEY_NAME into the
 image's /etc/apk/keys so apk treats them as trusted:
 
   bash build.sh --profile $PROFILE

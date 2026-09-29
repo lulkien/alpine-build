@@ -4,28 +4,46 @@
 #
 #   bash scripts/00-fetch-inputs.sh
 #
-# Produces: u-boot-sunxi-with-spl.bin, alpine-minirootfs-*.tar.gz and
-# kernel/{6.18.53.tar.gz, 6.18.53/, boot/, dtbs/}.
+# What to fetch is board data (board/common/board.toml plus the platform file):
+# the kernel asset, u-boot and the Alpine minirootfs, each with its checksum.
+# Produces: <uboot_file>, alpine-minirootfs-*.tar.gz and
+# kernel/{<kernel>.tar.gz, <kernel>/, boot/, dtbs/}.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
-KREL=6.18.53-ophub
-KDIR=6.18.53
-ALPINE_BRANCH=v3.22
-ALPINE_RELEASE=3.22.6
-ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
-MINIROOTFS=alpine-minirootfs-$ALPINE_RELEASE-aarch64.tar.gz
-UBOOT=u-boot-sunxi-with-spl.bin
+# The machine's values - kernel and u-boot to fetch, Alpine release, checksums -
+# are data: board/common/board.toml plus board/platform/<name>/board.toml,
+# resolved by tools/buildcfg.py. Stage 03 writes build/board.env for the
+# containers; on a fresh workspace the values are resolved here instead.
+mkdir -p build 2>/dev/null || true
+if [ -f build/board.env ]; then
+  # written by stage 03 on an earlier run of this workspace
+  # shellcheck disable=SC1091
+  . build/board.env
+else
+  # Resolved here instead of written: build/ belongs to root once a container has
+  # written into it, and this stage runs on the host. The emitted text is quoted,
+  # so eval is safe with values that contain spaces.
+  eval "$(python3 tools/buildcfg.py board show ${BOARD:+$BOARD} --emit env)"
+fi
 
-KERNEL_URL=https://github.com/ophub/kernel/releases/download/kernel_stable/$KDIR.tar.gz
-UBOOT_URL=https://raw.githubusercontent.com/ophub/u-boot/main/u-boot/allwinner/x98h/$UBOOT
+KREL="$BOARD_KERNEL_RELEASE"
+KDIR="$BOARD_KERNEL"
+ALPINE_BRANCH="$BOARD_ALPINE_BRANCH"
+ALPINE_RELEASE="$BOARD_ALPINE_RELEASE"
+ALPINE_MIRROR="$BOARD_ALPINE_MIRROR"
+MINIROOTFS=alpine-minirootfs-$ALPINE_RELEASE-aarch64.tar.gz
+UBOOT="$BOARD_UBOOT_FILE"
+
+KERNEL_URL="$BOARD_KERNEL_URL"
+UBOOT_URL="$BOARD_UBOOT_URL"
 MINIROOTFS_URL=$ALPINE_MIRROR/$ALPINE_BRANCH/releases/aarch64/$MINIROOTFS
 
-KERNEL_SHA=269dd8ded019f829723968a236bac40335dc9488aac8f22cf1afd5b9f3a20bb7
-UBOOT_SHA=4c6afa2ef90610318dbd4f9a201a432610eb0eb025afd06e8d7bf69c17309e96
-MINIROOTFS_SHA=821565fa8f3953eefd12497b166b4b50add2f7c57fb312e75862f5867e06fefe
+KERNEL_SHA="$BOARD_KERNEL_SHA256"
+UBOOT_SHA="$BOARD_UBOOT_SHA256"
+MINIROOTFS_SHA="$BOARD_ALPINE_MINIROOTFS_SHA256"
 
 check() {
   echo "$2  $1" | sha256sum -c -

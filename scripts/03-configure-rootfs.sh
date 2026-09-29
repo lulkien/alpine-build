@@ -1,17 +1,23 @@
 #!/bin/bash
-# Configure the bootstrapped Alpine rootfs for the Z8Pro and drop in the
-# Allwinner BSP kernel (6.18.53-ophub) that the box is known to boot with.
+# Configure the bootstrapped Alpine rootfs for one machine, from board data.
+#
+# The machine is board/common/board.toml plus board/platform/<name>/board.toml,
+# resolved by tools/buildcfg.py into build/board.env: the kernel and u-boot to
+# expect, the devicetree and its overlays, the hostname, the image's IDs and the
+# runtime files that ship. Nothing in this script names a board, a kernel version
+# or a devicetree file - that is the point of the layer.
 #
 # What goes into the image is decided by a profile: profiles/common.toml plus
-# profiles/<name>.toml, resolved by tools/buildcfg.py into bash arrays, which is
-# what this script installs from and enables. --profile defaults to headless.
-# The resolved lists are kept in build/profile.env so 03 can assert the finished
-# image against exactly what this stage installed.
+# profiles/<name>.toml, resolved into bash arrays, which is what this script
+# installs from and enables. --profile defaults to headless. The resolved lists
+# are kept in build/profile.env so 03 can assert the finished image against
+# exactly what this stage installed.
 #
-# Kernel choice: mainline has no node or driver for the X98H's wired port
-# (sun50i-h616.dtsi defines only emac0; the X98H PHY hangs off emac1/RMII in
-# the vendor DTB), so the BSP kernel + BSP DTB is used for hardware support.
-# Alpine linux-lts is an ordinary profile package, not a kernel choice.
+# Why this board needs the vendor kernel at all: mainline has no node or driver
+# for the X98H's wired port (sun50i-h616.dtsi defines only emac0; the box's PHY
+# hangs off emac1/RMII in the vendor DTB), so the BSP kernel + BSP DTB is used for
+# hardware support. Alpine linux-lts is an ordinary profile package, not a kernel
+# choice. The port is fixed for real by the board's devicetree overlay.
 #
 # Runs as root inside a throwaway Debian container; writes only into /work.
 set -euo pipefail
@@ -20,13 +26,30 @@ WORK=/work
 ROOT="$WORK/rootfs"
 BUILDDIR="$WORK/build"
 PACKAGES_DIR="$WORK/packages"
-KREL=6.18.53-ophub
-KDIR=6.18.53
-BOARD_HOSTNAME=solovox
-ROOT_PARTUUID=abcd1234-01
-TZ_NAME=Asia/Ho_Chi_Minh
-SSH_PUBKEY_FILE="$WORK/board/authorized_keys"
 PROFILE="${PROFILE:-headless}"
+
+# The machine's values are data: board/common/board.toml plus
+# board/platform/<name>/board.toml. build.sh resolves them before the containers
+# start; doing it again here (python3 is in this container) keeps this stage
+# runnable on its own, and this is the only place build/board.env is written.
+mkdir -p "$BUILDDIR"
+BOARD="${BOARD:-${BOARD_MACHINE:-}}"
+if [ -f "$BUILDDIR/board.env" ]; then
+  # shellcheck disable=SC1090
+  . "$BUILDDIR/board.env"
+fi
+BOARD="${BOARD:-$BOARD_MACHINE}"
+[ -n "$BOARD" ] || BOARD=$(python3 "$WORK/tools/buildcfg.py" board list | head -1)
+python3 "$WORK/tools/buildcfg.py" board show "$BOARD" --emit env > "$BUILDDIR/board.env"
+# shellcheck disable=SC1090
+. "$BUILDDIR/board.env"
+
+# The names the rest of this script uses. The board layer is their only source:
+# no board name, kernel version or devicetree file is written into this script.
+KREL="$BOARD_KERNEL_RELEASE"
+KDIR="$BOARD_KERNEL"
+ROOT_PARTUUID="$BOARD_ROOT_PARTUUID"
+TZ_NAME="$BOARD_TIMEZONE"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,7 +59,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -d "$ROOT" ] || { echo "rootfs missing: run 01 first" >&2; exit 1; }
+[ -d "$ROOT" ] || { echo "rootfs missing: run 02 first" >&2; exit 1; }
 
 cleanup() {
   for m in proc dev sys; do
@@ -76,7 +99,7 @@ if [ "${#PROFILE_RECIPES[@]}" -gt 0 ]; then
   # see /work.
   if [ ! -d "$WORK/build/keys" ]; then
     echo "FAIL: no signing key in $WORK/build/keys" >&2
-    echo "      run scripts/05-build-recipes.sh --profile $PROFILE first" >&2
+    echo "      run scripts/01-build-recipes.sh --profile $PROFILE first" >&2
     exit 1
   fi
   install -d -m 755 "$ROOT/etc/apk/keys"
@@ -92,7 +115,7 @@ if [ "${#PROFILE_RECIPES[@]}" -gt 0 ]; then
     done
     if [ -z "$apk_file" ]; then
       echo "FAIL: no built package for recipe '$recipe' in $PACKAGES_DIR" >&2
-      echo "      run scripts/05-build-recipes.sh --profile $PROFILE first" >&2
+      echo "      run scripts/01-build-recipes.sh --profile $PROFILE first" >&2
       exit 1
     fi
     install -m 644 "$apk_file" "$ROOT/tmp/$(basename "$apk_file")"
@@ -111,7 +134,7 @@ EOF
 
 cat > "$ROOT/etc/fstab" <<EOF
 # <file system>	<mount point>	<type>	<options>		<dump>	<pass>
-UUID=9f1c7a3e-5b21-4f8d-9a1c-7b2d4e6f8a90	/	ext4	noatime,errors=remount-ro	0	1
+UUID=$BOARD_ROOTFS_UUID	/	ext4	noatime,errors=remount-ro	0	1
 EOF
 
 cat > "$ROOT/etc/network/interfaces" <<'EOF'
@@ -132,7 +155,9 @@ DROPBEAR_OPTS="-s"
 DROPBEAR_BANNER=""
 EOF
 mkdir -p "$ROOT/root/.ssh"
-install -m 600 "$SSH_PUBKEY_FILE" "$ROOT/root/.ssh/authorized_keys"
+# The key itself is a runtime file (board/common/runtime/root/root/.ssh/), copied
+# with its tree further down and kept 0600 by BOARD_PRIVATE_FILES: this script
+# never names the file.
 
 # Services are enabled further down, from the profile's list, once the board's
 # own init scripts are in place: every entry is checked against the image, so an
@@ -152,34 +177,52 @@ NTPD_OPTS="-N -p pool.ntp.org -p time.cloudflare.com"
 EOF
 grep -E "^ntp:" "$ROOT/etc/passwd" >/dev/null || echo "WARNING: no ntp user for the ntpd service" >&2
 
-echo "--- BSP kernel files into /boot"
+echo "--- board kernel files into /boot"
 mkdir -p "$ROOT/boot/dtbs/allwinner/overlay" "$ROOT/boot/extlinux"
 install -m 755 "$WORK/kernel/boot/vmlinuz-$KREL" "$ROOT/boot/vmlinuz-$KREL"
 install -m 644 "$WORK/kernel/boot/System.map-$KREL" "$ROOT/boot/System.map-$KREL"
 install -m 644 "$WORK/kernel/boot/config-$KREL" "$ROOT/boot/config-$KREL"
-install -m 644 "$WORK/kernel/dtbs/sun50i-h618-x98h.dtb" "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h.dtb"
+install -m 644 "$WORK/kernel/dtbs/$BOARD_DTB" "$ROOT/boot/dtbs/allwinner/$BOARD_DTB"
 
-echo "--- Z8Pro / X98H-clone ethernet overlay -> merged DTB"
-# Overlay sets the emac1 MDIO PHY reg from 1 to 0 (clone PHY strapping).
-# Merged at build time: the kernel has no initramfs here to apply overlays,
-# and this u-boot is not relied on for FDTOVERLAYS support.
+echo "--- board devicetree overlays -> $BOARD_BOOT_DTB"
+# The overlays are the board's own sources (BOARD_OVERLAYS, .dtso), compiled and
+# merged here: the kernel has no initramfs to apply overlays, and this u-boot is
+# not relied on for FDTOVERLAYS support. One overlay or several - fdtoverlay takes
+# them in order. The compiled artifacts belong to the build, not the tree: they go
+# under build/, which is ignored and wiped by a clean.
 rm -f "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h-ethfix.dtb" # pre-rename artifact
-dtc -@ -I dts -O dtb -o "$WORK/board/sun50i-h618-z8pro.dtbo" "$WORK/board/sun50i-h618-z8pro-overlay.dts" 2>/dev/null
-fdtoverlay -i "$ROOT/boot/dtbs/allwinner/sun50i-h618-x98h.dtb" \
-           -o "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" \
-           "$WORK/board/sun50i-h618-z8pro.dtbo"
-install -m 644 "$WORK/board/sun50i-h618-z8pro.dtbo" "$ROOT/boot/dtbs/allwinner/overlay/"
-# The merge must actually have landed: PHY reg 0x00 on the emac1 MDIO bus.
-# Captured, not piped into `grep -q`: grep exits at the first match, the writer
-# then dies of SIGPIPE, and with pipefail that reads as a failed check. The DTS
-# dump is bigger than a pipe buffer, so this race is real, not theoretical.
-phy_node=$(dtc -I dtb -O dts "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" 2>/dev/null \
-  | sed -n '/ethernet-phy@1/,/};/p')
-case "$phy_node" in
-  *"reg = <0x00>"*) ;;
-  *) echo "ethfix overlay did not apply (PHY reg still 1)" >&2; exit 1 ;;
+# the overlay was installed as sun50i-h618-z8pro.dtbo before this file was
+# renamed; a reused rootfs keeps it otherwise, and two overlays for one board in
+# /boot/dtbs/allwinner/overlay/ invite reading the wrong one
+rm -f "$ROOT/boot/dtbs/allwinner/overlay/sun50i-h618-z8pro.dtbo"
+DTBO_DIR="$WORK/build/devicetree/overlay"
+mkdir -p "$DTBO_DIR"
+DTBOS=()
+for overlay in "${BOARD_OVERLAYS[@]}"; do
+  overlay_name=$(basename "${overlay%.dtso}")
+  dtc -@ -I dts -O dtb -o "$DTBO_DIR/$overlay_name.dtbo" \
+    "$WORK/$BOARD_DIR/$overlay" 2>/dev/null
+  DTBOS+=("$DTBO_DIR/$overlay_name.dtbo")
+done
+fdtoverlay -i "$ROOT/boot/dtbs/allwinner/$BOARD_DTB" \
+           -o "$ROOT/boot/dtbs/allwinner/$BOARD_BOOT_DTB" \
+           "${DTBOS[@]}"
+install -m 644 "${DTBOS[@]}" "$ROOT/boot/dtbs/allwinner/overlay/"
+# The merge must actually have landed: the node the board layer names must contain
+# the text it names, or the board boots with a dead port and it reads as a hardware
+# fault. Captured, not piped into `grep -q`: grep exits at the first match, the
+# writer then dies of SIGPIPE, and with pipefail that reads as a failed check. The
+# DTS dump is bigger than a pipe buffer, so this race is real, not theoretical.
+merged_node=$(dtc -I dtb -O dts "$ROOT/boot/dtbs/allwinner/$BOARD_BOOT_DTB" 2>/dev/null \
+  | sed -n "/$BOARD_MERGE_CHECK_NODE/,/};/p")
+case "$merged_node" in
+  *"$BOARD_MERGE_CHECK_TEXT"*) ;;
+  *) echo "FAIL: $BOARD_MERGE_CHECK_NODE in $BOARD_BOOT_DTB does not contain" \
+          "'$BOARD_MERGE_CHECK_TEXT': the overlay did not apply" >&2
+     exit 1 ;;
 esac
-echo "    merged: $(ls -l "$ROOT/boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb" | awk '{print $5}') bytes"
+echo "    merged: $(stat -c %s "$ROOT/boot/dtbs/allwinner/$BOARD_BOOT_DTB") bytes," \
+     "$BOARD_MERGE_CHECK_NODE has $BOARD_MERGE_CHECK_TEXT"
 
 echo "--- BSP modules into /lib/modules"
 # The tarball's top-level directory is already named <KREL>, so it must be
@@ -201,24 +244,64 @@ sed -i -e 's|^\techo "/sbin/mdev" > /proc/sys/kernel/hotplug|\t[ -e /proc/sys/ke
   "$ROOT/etc/init.d/mdev"
 grep -n "hotplug" "$ROOT/etc/init.d/mdev"
 
-echo "--- board tools"
+echo "--- board runtime files"
+# board/common/runtime/root/ mirrors the image's layout: a file's path in the tree
+# is its path on the board, so modes, the two OpenRC runlevel symlinks and the
+# ownership all carry themselves. This is why no destination is written down here,
+# and why config and executables are as separate as they are on the running
+# system: a script sits where the init system looks for it, the SSH key under
+# /root/.ssh. A platform may add its own tree of the same shape (board.toml's
+# runtime_root lists them in order).
+#
 # ota-flash (OS side) does not write the disk: it arms the next boot into flash
 # mode and reboots. Flash mode is what writes, from RAM, with no rootfs mounted.
-install -m 755 "$WORK/board/ota-flash" "$ROOT/usr/sbin/ota-flash"
-
-echo "--- growfs (fill the card on the first boot after a flash)"
-# flash mode extends the root partition to the end of the card before it
-# reboots; this service grows the filesystem into it once, then reports that
-# there is nothing to do on later boots.
+# growfs fills the card on the first boot after a flash; flash mode extends the
+# root partition before it reboots, and the service grows the filesystem into it
+# once, then reports there is nothing to do.
+for tree in "${BOARD_RUNTIME_ROOTS[@]}"; do
+  echo "    $tree"
+  # -rlptDHX, not -a: the file's mode in the tree is the mode on the board (git
+  # tracks the executable bit, which is why the tree is the source of truth), but
+  # ownership must not be copied - the files are root's on the board, and a
+  # host-user-owned authorized_keys is a key dropbear refuses.
+  rsync -rlptDHX --numeric-ids --no-owner --no-group "$WORK/$tree/" "$ROOT/"
+done
+for item in "${BOARD_PRIVATE_FILES[@]}"; do
+  chmod 600 "$ROOT/$item"
+done
+# The files are root's on the board. rsync runs as root inside the container but
+# writes as the receiving user, and a reused rootfs keeps an older uid, so say it
+# explicitly: sshd and dropbear refuse an authorized_keys that is not owned by the
+# user it authenticates.
+for tree in "${BOARD_RUNTIME_ROOTS[@]}"; do
+  ( cd "$WORK/$tree" && find . \( -type f -o -type l \) -printf '%P\n' ) |
+    while IFS= read -r rel; do
+      chown -h 0:0 "$ROOT/$rel"
+    done
+done
+# What the tree promises has to be true of the image: an init script that is not
+# executable, or a service that is in the tree but not enabled, boots as a
+# missing daemon and reads like a bug in the software.
+for tree in "${BOARD_RUNTIME_ROOTS[@]}"; do
+  for script in "$WORK/$tree"/etc/init.d/*; do
+    [ -e "$script" ] || continue
+    name=$(basename "$script")
+    [ -x "$ROOT/etc/init.d/$name" ] ||
+      { echo "FAIL: /etc/init.d/$name is missing or not executable in the rootfs" >&2; exit 1; }
+  done
+  for level in "$WORK/$tree"/etc/runlevels/*; do
+    [ -d "$level" ] || continue
+    level_name=$(basename "$level")
+    for entry in "$level"/*; do
+      [ -e "$entry" ] || continue
+      name=$(basename "$entry")
+      [ -L "$ROOT/etc/runlevels/$level_name/$name" ] ||
+        { echo "FAIL: $name is not enabled in the $level_name runlevel" >&2; exit 1; }
+    done
+  done
+done
 RESIZE=""; for c in "$ROOT/usr/sbin/resize2fs" "$ROOT/sbin/resize2fs"; do [ -x "$c" ] && RESIZE="$c"; done
 [ -n "$RESIZE" ] || { echo "FAIL: resize2fs missing from the rootfs (needs e2fsprogs-extra)"; exit 1; }
-install -m 755 "$WORK/board/growfs" "$ROOT/etc/init.d/growfs"
-ln -sf /etc/init.d/growfs "$ROOT/etc/runlevels/boot/growfs"
-
-echo "--- mdev hotplug daemon (this kernel has no uevent helper, so nothing"
-echo "    creates /dev nodes or loads modules for hotplugged devices)"
-install -m 755 "$WORK/board/mdev-hotplug" "$ROOT/etc/init.d/mdev-hotplug"
-ln -sf /etc/init.d/mdev-hotplug "$ROOT/etc/runlevels/boot/mdev-hotplug"
 
 echo "--- flash-mode initramfs"
 # Static busybox + the flash init + the bmap writer in a cpio archive. This is
@@ -230,8 +313,12 @@ mkdir -p "$IR/bin" "$IR/dev" "$IR/tmp" "$IR/proc" "$IR/sys" "$IR/mnt/root"
 [ -x "$ROOT/bin/busybox.static" ] || { echo "FAIL: busybox-static missing from the rootfs"; exit 1; }
 install -m 755 "$ROOT/bin/busybox.static" "$IR/bin/busybox"
 ln -sf busybox "$IR/bin/sh"
-install -m 755 "$WORK/board/flash-init" "$IR/init"
-install -m 755 "$WORK/board/bmap-write.sh" "$IR/bin/bmap-write"
+# The flash-mode /init and its bmap writer come from the runtime trees
+# (board/common/runtime/initramfs/: init -> /init, bin/bmap-write -> /bin/bmap-write),
+# the same mirror-the-destination convention as the rootfs tree.
+for tree in "${BOARD_RUNTIME_INITRAMFS_DIRS[@]}"; do
+  rsync -rlptDHX --numeric-ids --no-owner --no-group "$WORK/$tree/" "$IR/"
+done
 [ -f "$ROOT/usr/share/udhcpc/default.script" ] || { echo "FAIL: no udhcpc script in the rootfs"; exit 1; }
 install -m 755 "$ROOT/usr/share/udhcpc/default.script" "$IR/udhcpc.script"
 # init's stdio is /dev/console: it has to exist before the kernel execs /init
@@ -278,6 +365,7 @@ echo "--- image manifest"
 # Read on the board at /etc/solovox/image-manifest.
 install -d -m 755 "$ROOT/etc/solovox"
 {
+  python3 "$WORK/tools/buildcfg.py" board show "$BOARD" --emit manifest
   python3 "$WORK/tools/buildcfg.py" profile show "$PROFILE" --emit manifest
   printf 'built: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'packages:\n'
@@ -301,19 +389,19 @@ MENU TITLE Solovox Z8Pro Alpine
 LABEL bsp
   MENU LABEL Alpine (BSP kernel $KREL, Z8Pro ethfix)
   LINUX /boot/vmlinuz-$KREL
-  FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
+  FDT /boot/dtbs/allwinner/$BOARD_BOOT_DTB
   APPEND root=PARTUUID=$ROOT_PARTUUID rw rootfstype=ext4 rootwait console=ttyS0,115200 console=tty0 panic=30 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
 
 LABEL bsp-nofix
   MENU LABEL Alpine (BSP kernel $KREL, unpatched vendor DTB)
   LINUX /boot/vmlinuz-$KREL
-  FDT /boot/dtbs/allwinner/sun50i-h618-x98h.dtb
+  FDT /boot/dtbs/allwinner/$BOARD_DTB
   APPEND root=PARTUUID=$ROOT_PARTUUID rw rootfstype=ext4 rootwait console=ttyS0,115200 console=tty0 panic=30 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
 
 LABEL debug
   MENU LABEL Alpine debug (BSP kernel, explicit /dev/mmcblk0p1, loglevel=8)
   LINUX /boot/vmlinuz-$KREL
-  FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
+  FDT /boot/dtbs/allwinner/$BOARD_BOOT_DTB
   APPEND root=/dev/mmcblk0p1 rw rootfstype=ext4 ignore_loglevel loglevel=8 panic=15 console=ttyS0,115200 console=tty0 no_console_suspend consoleblank=0 max_loop=128 net.ifnames=0 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e
 
 EOF
@@ -346,7 +434,7 @@ cat >> "$ROOT/boot/extlinux/extlinux.conf" <<EOF
 LABEL flash
   MENU LABEL Flash mode (downloads and writes an image, no OS running)
   LINUX /boot/vmlinuz-$KREL
-  FDT /boot/dtbs/allwinner/sun50i-h618-z8pro-ethfix.dtb
+  FDT /boot/dtbs/allwinner/$BOARD_BOOT_DTB
   INITRD /boot/flash-initramfs.gz
   APPEND rdinit=/init console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7 video=HDMI-A-1:1920x1080@60e panic=30
 EOF
