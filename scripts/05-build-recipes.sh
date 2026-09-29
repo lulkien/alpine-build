@@ -254,8 +254,15 @@ for json in "$BUILD_DIR"/*.json; do
 
   DESTDIR="$BUILD_DIR/destdir/$name"
   APK_OUT="$PACKAGES_DIR/${name}_${version}-r0.apk"
-  if [ -f "$APK_OUT" ] && [ "$FORCE" != 1 ]; then
-    log "$name: $APK_OUT exists (--force to rebuild)"
+  # The package is reused only when it was built from this exact recipe file: the
+  # file carries the commit, the siblings and the build hook, so hashing it is what
+  # makes a bumped pin (or an edited hook) rebuild instead of silently shipping the
+  # old binary under the new commit's name in the manifest.
+  STAMP_DIR="$BUILD_DIR/built"
+  STAMP="$STAMP_DIR/$name"
+  stamp_now=$(sha256sum "$RECIPES_DIR/$name.toml" | cut -d' ' -f1)
+  if [ -f "$APK_OUT" ] && [ "$FORCE" != 1 ] && [ "$(cat "$STAMP" 2>/dev/null || true)" = "$stamp_now" ]; then
+    log "$name: $APK_OUT is up to date with $(basename "$RECIPES_DIR/$name.toml") (--force to rebuild)"
     continue
   fi
 
@@ -316,6 +323,10 @@ for json in "$BUILD_DIR"/*.json; do
       --description "built from $(basename "$repo")@${ref:0:12}" \
       ${depends:+$(for d in $depends; do printf ' --depend %s' "$d"; done)}
   fi
+
+  # what this package was built from, for the next run's reuse decision
+  mkdir -p "$STAMP_DIR"
+  printf '%s\n' "$stamp_now" > "$STAMP"
 done
 
 log "done"
