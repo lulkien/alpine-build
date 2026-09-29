@@ -92,7 +92,7 @@ that are not package names.
 name = "simple-graphics-controller"
 version = "0.1.0"
 repo = "https://github.com/sgc-project/simple-graphics-controller.git"
-ref = "32ed0ad81dd7e2b421b4d5809b63937165f2b54f"
+ref = "8a4562a02b7fd3b5a9595e1cbf68b3a8f6a27a02"
 makedepends = ["rust", "cargo", "binutils", "file"]
 depends = []
 build = """

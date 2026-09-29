@@ -26,11 +26,9 @@ maintainer = "lulkien <kien.luuhoang.arch@proton.me>"
 # https, not the ssh remote: the build chroot has no keys.
 repo = "https://github.com/sgc-project/simple-graphics-controller.git"
 
-# A full commit sha, never a branch: this is the head of the pull request that
-# adds the Alpine packaging (APKBUILD + packaging/openrc), which is what this
-# recipe now packages. Bump it to the merge commit on master once that lands -
-# the sha stays fetchable meanwhile, since GitHub keeps the pull request ref.
-ref = "32ed0ad81dd7e2b421b4d5809b63937165f2b54f"
+# A full commit sha, never a branch: master's head, which is the merge of the
+# Alpine packaging (APKBUILD + packaging/openrc) this recipe packages.
+ref = "8a4562a02b7fd3b5a9595e1cbf68b3a8f6a27a02"
 
 # Alpine packages installed in the build chroot before `build` runs.
 #
