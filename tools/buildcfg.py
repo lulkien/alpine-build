@@ -4,7 +4,8 @@
 Two kinds of TOML file live in this repository, and both are read here so that
 the same strictness applies to each:
 
-    profiles/common.toml + profiles/<name>.toml   what an image contains
+    profiles/essential.toml + profiles/<name>.toml  what an image contains (a
+                                                 profile inherits layers)
     recipes/<name>.toml                           how a piece of software is
                                                   fetched, built and packaged
 
@@ -47,7 +48,10 @@ PROFILE_LIST_KEYS = (
     "recipes",
     "runtime_apk_add",
 )
-PROFILE_KEYS = {"name", *PROFILE_LIST_KEYS}
+PROFILE_KEYS = {"name", "inherit", *PROFILE_LIST_KEYS}
+# The layer every profile inherits unless it says otherwise; it is not offered as
+# a profile of its own by `profile list`.
+ESSENTIAL_LAYER = "essential"
 
 RECIPE_LIST_KEYS = ("depends", "makedepends", "sources")
 RECIPE_STRING_KEYS = (
@@ -180,78 +184,165 @@ def check_apk_names(path: Path, key: str, items: list[str]) -> None:
             raise ConfigError(f"{path}: {key} entry {item!r} is not a package name")
 
 
+def layers_of(path: Path, data: dict) -> list[str]:
+    """The layers a profile file inherits, in the order it names them."""
+    raw = data.get("inherit")
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, list):
+        raise ConfigError(
+            f"{path}: inherit must be a layer name or an array of layer names"
+        )
+    layers: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"{path}: inherit names layers ({item!r} is not one); a layer is a"
+                " profiles/<name>.toml"
+            )
+        item = item.strip()
+        if item.endswith(".toml") or "/" in item:
+            raise ConfigError(
+                f"{path}: inherit takes a layer name, not a path or a filename"
+                f" ({item!r})"
+            )
+        if item not in layers:
+            layers.append(item)
+    return layers
+
+
 def resolve_profile(name: str) -> dict:
-    """Merge profiles/common.toml with profiles/<name>.toml into one image spec."""
+    """Resolve profiles/<name>.toml over the layers it inherits.
+
+    A profile states its difference from the layers it names:
+
+        inherit = "essential"                  one layer
+        inherit = ["essential", "graphics"]    several, folded left to right
+
+    A layer is resolved the same way before it is applied, so the layers come out
+    in one order - the deepest parent first, each parent's own inheritance before
+    the layer itself, and the profile last. Each layer's lists are then applied
+    onto what the layers before it left:
+
+        kept = []                                    what the image gets
+        for layer in that order:
+            kept += layer.apk_add        # already there: no change
+            kept -= layer.apk_remove     # a later add puts it back, at the end
+
+    Which means the layer that touched a package last decides: a removal is not a
+    veto, so `inherit = ["base", "no-b"]` where `no-b` removes what the layers
+    before it added, and a third layer that asks for it again, ends up with it
+    installed. The emitted apk_remove carries only what ends up removed, since
+    that list is what the build removes from the rootfs and asserts absent in the
+    image.
+    """
     if not name:
         raise ConfigError("no profile given (--profile <name> or PROFILES_DIR)")
-    if name == "common":
-        raise ConfigError("'common' is the shared layer, not a profile")
 
-    common_path = PROFILES_DIR / "common.toml"
+    # the layers, in the order they apply: parents before what inherits them
+    resolved: list[tuple[Path, dict]] = []
+    chain: list[str] = []
+
+    def visit(layer: str, path: Path, stack: tuple[str, ...]) -> None:
+        data = read_toml(path)
+        check_keys(path, data, PROFILE_KEYS)
+
+        declared = string(path, data, "name")
+        if not declared:
+            raise ConfigError(
+                f'{path}: has no name; it must match the file: name = "{layer}"'
+            )
+        if declared != layer:
+            raise ConfigError(
+                f'{path}: declares name = "{declared}" but was loaded as {layer!r}'
+            )
+
+        for parent in layers_of(path, data):
+            if parent in stack:
+                raise ConfigError(
+                    f"{path}: inherit = {parent!r} closes a loop ("
+                    + " -> ".join((*stack, parent))
+                    + ")"
+                )
+            parent_path = PROFILES_DIR / f"{parent}.toml"
+            if not parent_path.is_file():
+                raise ConfigError(
+                    f"{path}: inherits {parent!r}, but there is no"
+                    f" profiles/{parent}.toml"
+                )
+            visit(parent, parent_path, (*stack, parent))
+
+        resolved.append((path, data))
+        if layer not in chain:
+            chain.append(layer)
+
     path = PROFILES_DIR / f"{name}.toml"
-    common = read_toml(common_path)
-    profile = read_toml(path)
+    if not path.is_file():
+        raise ConfigError(f"no such file: {path}")
+    visit(name, path, (name,))
 
-    check_keys(common_path, common, PROFILE_KEYS)
-    check_keys(path, profile, PROFILE_KEYS)
-
-    common_name = string(common_path, common, "name")
-    if common_name and common_name != "common":
-        raise ConfigError(
-            f'{common_path}: declares name = "{common_name}"; the common layer is'
-            ' not a profile (use name = "common" or omit it)'
-        )
-    profile_name = string(path, profile, "name")
-    if not profile_name:
-        raise ConfigError(f'{path}: has no name; it must match the file: name = "{name}"')
-    if profile_name != name:
-        raise ConfigError(
-            f'{path}: declares name = "{profile_name}" but was loaded as {name!r}'
-        )
-
-    merged: dict[str, list[str]] = {
-        key: string_list(common_path, common, key) for key in PROFILE_LIST_KEYS
-    }
-    for key in PROFILE_LIST_KEYS:
-        for item in string_list(path, profile, key):
-            if item not in merged[key]:
-                merged[key].append(item)
-
-    check_apk_names(common_path, "apk_add", merged["apk_add"])
-    check_apk_names(path, "apk_add", merged["apk_add"])
-    check_apk_names(path, "runtime_apk_add", merged["runtime_apk_add"])
-
-    # A removal that removes nothing is a typo, or an attempt to drop something the
-    # build itself needs (those live in scripts/01, not in the common layer).
-    for item in merged["apk_remove"]:
-        if item not in merged["apk_add"]:
-            raise ConfigError(
-                f"{path}: apk_remove lists {item!r}, which is not in the merged package"
-                " set (packages the build itself needs stay in scripts/01)"
+    def settle(key_in: str, key_out: str | None = None) -> tuple[list[str], list[str]]:
+        """Apply one key pair layer by layer. Returns what ends up in the image
+        and everything any layer asked for (a removal has to name one of those)."""
+        kept: list[str] = []
+        asked: list[str] = []
+        for path, data in resolved:
+            for item in string_list(path, data, key_in):
+                if item not in asked:
+                    asked.append(item)
+                if item not in kept:
+                    kept.append(item)
+            if key_out:
+                for item in string_list(path, data, key_out):
+                    if item in kept:
+                        kept.remove(item)
+        if key_out:
+            what = "package" if key_in == "apk_add" else "service"
+            detail = (
+                " (packages the build itself needs stay in"
+                " scripts/02-bootstrap-rootfs.sh)"
+                if key_in == "apk_add"
+                else " (a service has to be one a layer enables)"
             )
-    for item in merged["services_remove"]:
-        if item not in merged["services"]:
-            raise ConfigError(
-                f"{path}: services_remove lists {item!r}, which is not in the merged"
-                " service set"
-            )
+            for path, data in resolved:
+                for item in string_list(path, data, key_out):
+                    if item not in asked:
+                        raise ConfigError(
+                            f"{path}: {key_out} lists {item!r}, which is not in the"
+                            f" merged {what} set{detail}"
+                        )
+        return kept, asked
 
-    remaining = [p for p in merged["apk_add"] if p not in merged["apk_remove"]]
-    if not remaining:
-        raise ConfigError(f"{path}: the merged package set is empty")
+    apk_add, asked_apk = settle("apk_add", "apk_remove")
+    services, asked_services = settle("services", "services_remove")
+    recipes, _ = settle("recipes")
+    runtime_apk_add, _ = settle("runtime_apk_add")
 
-    for recipe in merged["recipes"]:
+    check_apk_names(path, "apk_add", asked_apk)
+    check_apk_names(path, "runtime_apk_add", runtime_apk_add)
+
+    if not apk_add:
+        raise ConfigError(f"{name}: the merged package set is empty")
+
+    # only what ends up out: a removal a later layer undid must not reach the
+    # build, which would delete the package and then assert it absent
+    apk_remove = [p for p in asked_apk if p not in apk_add]
+    services_remove = [s for s in asked_services if s not in services]
+
+    for recipe in recipes:
         if not (RECIPES_DIR / f"{recipe}.toml").is_file():
-            raise ConfigError(f"{path}: recipes = [{recipe!r}] has no recipes/{recipe}.toml")
+            raise ConfigError(f"{name}: recipes = [{recipe!r}] has no recipes/{recipe}.toml")
 
     return {
         "profile": name,
-        "apk_add": remaining,
-        "apk_remove": merged["apk_remove"],
-        "services": [s for s in merged["services"] if s not in merged["services_remove"]],
-        "services_remove": merged["services_remove"],
-        "recipes": merged["recipes"],
-        "runtime_apk_add": merged["runtime_apk_add"],
+        "inherits": [layer for layer in chain if layer != name],
+        "apk_add": apk_add,
+        "apk_remove": apk_remove,
+        "services": services,
+        "services_remove": services_remove,
+        "recipes": recipes,
+        "runtime_apk_add": runtime_apk_add,
     }
 
 
@@ -521,8 +612,10 @@ def emit_manifest_board(spec: dict) -> str:
 
 
 def available_profiles() -> list[str]:
+    """Profiles that pick an image. The essential layer is listed only by
+    `profile show`, since a profile inherits it rather than being it."""
     return sorted(
-        p.stem for p in PROFILES_DIR.glob("*.toml") if p.stem != "common"
+        p.stem for p in PROFILES_DIR.glob("*.toml") if p.stem != ESSENTIAL_LAYER
     )
 
 
@@ -532,6 +625,8 @@ def available_recipes() -> list[str]:
 
 def emit_text_profile(spec: dict) -> str:
     lines = [f"profile: {spec['profile']}"]
+    layers = ", ".join(spec["inherits"]) or "(nothing)"
+    lines.append(f"inherits: {layers}")
     for key in ("apk_add", "apk_remove", "services", "recipes", "runtime_apk_add"):
         items = spec[key]
         lines.append(f"{key} ({len(items)}):")
@@ -569,6 +664,11 @@ def emit_manifest_profile(spec: dict) -> str:
     side that knows what actually landed in the image.
     """
     lines = [f"profile: {spec['profile']}"]
+    lines.append("inherits:")
+    if spec["inherits"]:
+        lines.extend(f"  {layer}" for layer in spec["inherits"])
+    else:
+        lines.append("  (nothing)")
     for key in ("apk_add", "apk_remove", "services", "runtime_apk_add"):
         lines.append(f"{key}:")
         lines.extend(f"  {item}" for item in spec[key])

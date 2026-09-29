@@ -25,8 +25,8 @@ Then flash `image/*.img` to an SD card and boot it.
 An image is two independent choices: a **board** (`board/platform/<name>/`, the
 machine: kernel, u-boot, devicetree, hostname, and the files that ship in it) and
 a **profile** (`profiles/<name>.toml`, the software: packages, services and
-recipes). `--board` defaults to the only platform installed. The stages
-themselves are `scripts/00`–`05`.
+recipes, plus an `inherit` naming the layers it starts from). `--board` defaults
+to the only platform installed. The stages themselves are `scripts/00`–`05`.
 
 Documentation: [docs/README.md](docs/README.md) — kernel choice (why the
 Allwinner BSP kernel rather than mainline), image layout, profiles and the

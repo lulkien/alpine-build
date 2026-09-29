@@ -1,15 +1,24 @@
-# Common layer: what every profile starts from
+# The essential layer: what every profile starts from
 #
-# A profile is common.toml plus profiles/<name>.toml, both parsed by
-# scripts/lib/profile.sh and resolved into the final package, service and
-# recipe lists. A profile only states its difference: keys it omits are the
-# common ones, and its arrays add to them. `apk_remove` / `services_remove`
-# subtract from the merged result (removal wins over addition).
+# A profile is not stacked on top of this file by the resolver; it names what it
+# inherits, and this is the layer every profile names:
+#
+#   inherit = "essential"                  one layer
+#   inherit = ["essential", "graphics"]    several, folded left to right
+#
+# A layer's own `inherit` is resolved first, so the layers apply in one order: the
+# deepest parent first, then what inherits it, the profile last. Each layer's
+# `apk_add` / `services` puts names into the merged set and its `apk_remove` /
+# `services_remove` takes them out again, so the layer that touched a name last
+# decides - a profile may remove what its layer added, and a layer below it may
+# put it back. A name already in the set keeps its position; a name put back goes
+# to the end.
 #
 # Two rules the resolver enforces:
 #   - only the keys below exist; an unknown key fails the build with a line
 #     number instead of being silently ignored,
-#   - `common` is not a profile: it never builds an image on its own.
+#   - the name must match the file; `essential` is a layer a profile inherits, so
+#     it is not offered by `profile list` (only by `profile show`).
 #
 # This file is also where the image content currently hardcoded in the build
 # scripts belongs, so that there is one place describing an image:
@@ -23,7 +32,7 @@
 # floor. Removing those does not produce a smaller image, it produces a broken
 # build, so they stay in scripts/02-bootstrap-rootfs.sh.
 
-name = "common"
+name = "essential"
 
 # Alpine packages from the v3.22 mirrors that every image carries.
 apk_add = [
@@ -38,7 +47,7 @@ apk_add = [
     "dosfstools",
 ]
 
-# Nothing removed from the common set by default. A profile that removes a
+# Nothing removed from the essential set by default. A profile that removes a
 # package the build asserts on (resize2fs, say) fails the build, which is the
 # point: the assertion names the path that would be missing.
 apk_remove = []
@@ -74,7 +83,7 @@ services = [
 
 services_remove = []
 
-# Packages built from recipes/<name>.toml. The common layer builds none: only a
+# Packages built from recipes/<name>.toml. The essential layer builds none: only a
 # profile that runs locally built software names any.
 recipes = []
 

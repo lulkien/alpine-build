@@ -431,26 +431,55 @@ kernel release (`kernel/6.18.53.tar.gz` unpacked to `kernel/boot`,
 
 ### Profiles
 
-What an image contains is a profile, not a flag:
+What an image contains is a profile, not a flag. A profile names the layers it
+inherits and then states its difference from them:
 
 ```
-profiles/common.toml          every image: ssh, DHCP client, tzdata, dosfstools,
+profiles/essential.toml       every image: ssh, DHCP client, tzdata, dosfstools,
                               linux-lts, the boot/default service lists
-profiles/headless.toml        nothing on top of common (the default profile)
-profiles/simple-graphics.toml common + the mesa userspace + the sgc daemon
+profiles/headless.toml        inherit = "essential", nothing of its own
+                              (the default profile)
+profiles/simple-graphics.toml inherit = "essential", plus the mesa userspace and
+                              the sgc daemon
 ```
 
-`tools/buildcfg.py` merges common with the chosen profile, subtracts what the
-profile removes (`apk_remove` of `linux-lts` in `simple-graphics`), and emits the
-resolved lists twice: as bash arrays into `build/profile.env` for stage 2 to
-install from, and as `/etc/solovox/image-manifest` inside the image, so a
-running box can say which profile it is and which commit each recipe came from.
-Stage 3 reads the same `build/profile.env` back and asserts the finished image
-against it: every package installed, every removal absent, every service shipped
-and enabled, and the `mainline` extlinux entry present only when `linux-lts`
-actually is. A profile is validated before any of that — unknown keys, a name
-that does not match the file, a removal that removes nothing, a service whose
-init script does not exist are all build errors (`tests/buildcfg.sh`).
+`inherit` takes one layer or an array, and the layers are merged left to right:
+
+```toml
+inherit = "essential"
+inherit = ["essential", "graphics"]
+```
+
+Each layer's own `inherit` is resolved first, then the layers are applied in that
+one order — the deepest parent first, each parent's inheritance before the layer
+itself, the profile last:
+
+```
+kept = []                                    what the image gets
+for layer in that order:
+    kept += layer.apk_add        # already there: no change
+    kept -= layer.apk_remove     # a later add puts it back, at the end
+```
+
+So the layer that touched a name last decides. A profile can remove what the layer
+it inherits added (that is how `simple-graphics` drops `linux-lts`), and a layer
+further down can put it back — an earlier removal is not a veto. The emitted
+`apk_remove` carries only what ends up removed, because that list is what stage 03
+`apk del`s and stage 04 asserts absent. Services resolve the same way.
+`tools/buildcfg.py` refuses a loop (`a` inheriting `b` inheriting `a`), a layer
+that does not exist, a layer name with `.toml` or a path in it, a removal that
+names nothing any layer asks for, and a merged package set that ends up empty.
+
+The resolved lists are emitted twice: as bash arrays into `build/profile.env` for
+stage 03 to install from, and as `/etc/solovox/image-manifest` inside the image
+(which records the profile, the layers it inherited, and the commit each recipe
+came from), so a running box can say what it is. Stage 04 reads the same
+`build/profile.env` back and asserts the finished image against it: every package
+installed, every removal absent, every service shipped and enabled, and the
+`mainline` extlinux entry present only when `linux-lts` actually is. A profile is
+validated before any of that — unknown keys, a name that does not match the file,
+a removal that removes nothing, a service whose init script does not exist are all
+build errors (`tests/buildcfg.sh`).
 
 Software that is not in the Alpine mirrors is a recipe; see
 [docs/recipes.md](recipes.md).

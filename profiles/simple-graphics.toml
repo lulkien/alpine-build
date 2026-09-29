@@ -1,16 +1,17 @@
 # Profile: simple-graphics
 #
 # An image that runs a GL/DRM client on a display lease from the
-# simple-graphics-controller daemon: the common layer, the mesa userspace such a
-# client needs, and the daemon itself.
+# simple-graphics-controller daemon: the essential layer, the mesa userspace such
+# a client needs, and the daemon itself.
 #
-# Every key here is a delta, so changes to the common layer reach this profile
-# without being repeated. Select it with `--profile simple-graphics` or
-# PROFILE=simple-graphics in the environment.
+# Every list here is a delta on what `essential` provides, so changes to the
+# essential layer reach this profile without being repeated. Select it with
+# `--profile simple-graphics` or PROFILE=simple-graphics in the environment.
 
 name = "simple-graphics"
+inherit = "essential"
 
-# Added on top of the common set.
+# Added on top of the essential set.
 #
 #   mesa-gbm          libgbm.so.1 — the buffer allocator a GBM client links
 #   mesa-egl, -gles   libEGL.so.1 / libGLESv2.so.2, dlopened by the client at

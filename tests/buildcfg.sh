@@ -62,7 +62,7 @@ env_out=$(python3 "$TOOL" profile show simple-graphics --emit env)
 # shellcheck disable=SC1090
 eval "$env_out"
 assert_eq "env: profile name" "simple-graphics" "$PROFILE_NAME"
-assert_eq "env: 14 packages (9 common + 6 mesa - linux-lts)" "14" "${#PROFILE_APK_ADD[@]}"
+assert_eq "env: 14 packages (9 essential + 6 mesa - linux-lts)" "14" "${#PROFILE_APK_ADD[@]}"
 assert_eq "env: one removal" "linux-lts" "${PROFILE_APK_REMOVE[0]}"
 assert_eq "env: 20 services" "20" "${#PROFILE_SERVICES[@]}"
 assert_eq "env: one recipe" "simple-graphics-controller" "${PROFILE_RECIPES[0]}"
@@ -75,6 +75,9 @@ fi
 json=$(python3 "$TOOL" profile show simple-graphics --emit json)
 assert_match "json: mesa-gbm is in the package set" "$json" '"mesa-gbm"'
 assert_match "json: the daemon service is enabled" "$json" 'default:simple-graphics-controller'
+assert_match "json: the layer it inherits is reported" "$json" '"inherits": \['
+assert_match "manifest: the layer is named" \
+  "$(python3 "$TOOL" profile show simple-graphics --emit manifest)" '^  essential$'
 
 echo "--- recipes"
 
@@ -101,8 +104,8 @@ assert_match "recipe json: ref is the pinned commit" "$rjson" "\"ref\": \"$toml_
 
 echo "--- profile fixtures"
 
-cat > "$PFIX/common.toml" <<'EOF'
-name = "common"
+cat > "$PFIX/essential.toml" <<'EOF'
+name = "essential"
 apk_add = ["bluez", "linux-lts"]
 services = ["default:networking"]
 apk_remove = []
@@ -110,6 +113,7 @@ EOF
 
 cat > "$PFIX/tiny.toml" <<'EOF'
 name = "tiny"
+inherit = "essential"
 apk_add = ["nano"]
 EOF
 PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show tiny >/dev/null &&
@@ -117,14 +121,16 @@ PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show tiny >/dev
 
 cat > "$PFIX/dupe.toml" <<'EOF'
 name = "dupe"
+inherit = "essential"
 apk_add = ["bluez"]
 EOF
 count=$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show dupe |
   grep -c '^  bluez$' || true)
-assert_eq "a repeated common entry is deduplicated" "1" "$count"
+assert_eq "an entry a layer already has is deduplicated" "1" "$count"
 
 cat > "$PFIX/rm.toml" <<'EOF'
 name = "rm"
+inherit = "essential"
 apk_remove = ["linux-lts"]
 services_remove = ["default:networking"]
 EOF
@@ -133,6 +139,118 @@ rmout=$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show rm
 section() { sed -n "/^$2 (/,/^[a-z_]* (/p" <<<"$1" | sed '$d'; }
 assert_no_match "a removed package leaves the set" "$(section "$rmout" apk_add)" '^  linux-lts$'
 assert_no_match "a removed service leaves the set" "$rmout" '^  default:networking$'
+
+echo "--- inheritance"
+
+# a layer between essential and the profile: three deep, resolved parent first
+cat > "$PFIX/graphics.toml" <<'EOF'
+name = "graphics"
+inherit = "essential"
+apk_add = ["mesa-gbm"]
+services = ["default:graphics-thing"]
+EOF
+cat > "$PFIX/gl-client.toml" <<'EOF'
+name = "gl-client"
+inherit = "graphics"
+apk_add = ["mesa-egl"]
+EOF
+glout=$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show gl-client)
+assert_match "a profile inherits through a layer" "$glout" '^  mesa-gbm$'
+assert_match "and keeps its own additions" "$glout" '^  mesa-egl$'
+assert_match "and reaches the bottom layer" "$glout" '^  bluez$'
+assert_match "the chain is reported" "$glout" '^inherits: essential, graphics$'
+
+# several layers: merged left to right, so a later one can take back what an
+# earlier one added
+cat > "$PFIX/one.toml" <<'EOF'
+name = "one"
+apk_add = ["nano", "zsh"]
+EOF
+cat > "$PFIX/two.toml" <<'EOF'
+name = "two"
+apk_add = ["vim"]
+apk_remove = ["nano"]
+EOF
+cat > "$PFIX/both.toml" <<'EOF'
+name = "both"
+inherit = ["one", "two"]
+EOF
+bothout=$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show both)
+assert_match "the later layer's packages are in" "$bothout" '^  vim$'
+assert_no_match "and it took back the earlier layer's" "$(section "$bothout" apk_add)" '^  nano$'
+assert_match "the earlier layer's others stay" "$bothout" '^  zsh$'
+# order: the merged list follows the layers, so one.toml's entry comes first
+order=$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show both |
+  grep -n '^  \(zsh\|vim\)$' | cut -d: -f2 | tr -d ' ')
+assert_eq "layers are merged in the order named" "zsh
+vim" "$order"
+
+cat > "$PFIX/repeat.toml" <<'EOF'
+name = "repeat"
+inherit = ["essential", "essential"]
+EOF
+PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show repeat >/dev/null &&
+  ok "naming the same layer twice is a no-op" || bad "naming the same layer twice is a no-op"
+
+# a layer further down puts back what a layer above it removed: last touch wins
+cat > "$PFIX/base-a.toml" <<'EOF'
+name = "base-a"
+apk_add = ["pkg-a", "pkg-b"]
+services = ["default:thing"]
+EOF
+cat > "$PFIX/no-a.toml" <<'EOF'
+name = "no-a"
+inherit = "base-a"
+apk_add = ["pkg-c"]
+apk_remove = ["pkg-a"]
+services_remove = ["default:thing"]
+EOF
+cat > "$PFIX/yes-a.toml" <<'EOF'
+name = "yes-a"
+inherit = "no-a"
+apk_add = ["pkg-a"]
+services = ["default:thing"]
+EOF
+yaout=$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show yes-a)
+assert_match "a removal a later layer undoes is not a veto" \
+  "$(section "$yaout" apk_add)" '^  pkg-a$'
+assert_no_match "and it is not emitted as a removal" \
+  "$(section "$yaout" apk_remove)" '^  pkg-a$'
+assert_match "a service put back the same way" "$(section "$yaout" services)" '^  default:thing$'
+assert_no_match "and it is not emitted as a removed service" \
+  "$(section "$yaout" services_remove)" '^  default:thing$'
+# putting it back moves it behind the names added after it
+readd_order=$(grep -n '^  \(pkg-a\|pkg-c\)$' <<<"$(section "$yaout" apk_add)" | cut -d: -f2 | tr -d ' ')
+assert_eq "a name put back goes to the end" "pkg-c
+pkg-a" "$readd_order"
+
+cat > "$PFIX/still-no.toml" <<'EOF'
+name = "still-no"
+inherit = "no-a"
+EOF
+assert_no_match "without the put-back the removal stands" \
+  "$(section "$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show still-no)" apk_add)" \
+  '^  pkg-a$'
+
+# one layer that asks for a name and drops it: the removal is the later of the two
+cat > "$PFIX/contra.toml" <<'EOF'
+name = "contra"
+apk_add = ["pkg-a", "pkg-b"]
+apk_remove = ["pkg-a"]
+EOF
+assert_no_match "a layer that adds and removes the same name removes it" \
+  "$(section "$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show contra)" apk_add)" \
+  '^  pkg-a$'
+
+# the essential layer is a layer, not an image choice: it resolves, but is not
+# offered by `profile list`
+PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile show essential >/dev/null &&
+  ok "the essential layer itself resolves" || bad "the essential layer itself resolves"
+assert_eq "profile list offers the profiles, not the layer" "no" "$(
+  PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile list |
+    grep -qx essential && echo yes || echo no)"
+assert_match "and it does offer a profile" \
+  "$(PROFILES_DIR="$PFIX" RECIPES_DIR="$RFIX" python3 "$TOOL" profile list)" '^tiny$'
 
 echo "--- profile rejections"
 
@@ -168,6 +286,7 @@ expect_fail "a nameless profile is refused" "$PFIX" "$RFIX" 'has no name' profil
 
 cat > "$PFIX/noremove.toml" <<'EOF'
 name = "noremove"
+inherit = "essential"
 apk_remove = ["linux-ltsx"]
 EOF
 expect_fail "removing a package that is not in the set is refused" "$PFIX" "$RFIX" \
@@ -175,6 +294,7 @@ expect_fail "removing a package that is not in the set is refused" "$PFIX" "$RFI
 
 cat > "$PFIX/noservice.toml" <<'EOF'
 name = "noservice"
+inherit = "essential"
 services_remove = ["default:nope"]
 EOF
 expect_fail "removing a service that is not in the set is refused" "$PFIX" "$RFIX" \
@@ -182,6 +302,7 @@ expect_fail "removing a service that is not in the set is refused" "$PFIX" "$RFI
 
 cat > "$PFIX/empty.toml" <<'EOF'
 name = "empty"
+inherit = "essential"
 apk_remove = ["bluez", "linux-lts"]
 EOF
 expect_fail "an empty merged package set is refused" "$PFIX" "$RFIX" 'package set is empty' \
@@ -189,13 +310,57 @@ expect_fail "an empty merged package set is refused" "$PFIX" "$RFIX" 'package se
 
 cat > "$PFIX/norecipe.toml" <<'EOF'
 name = "norecipe"
+inherit = "essential"
 recipes = ["does-not-exist"]
 EOF
 expect_fail "a profile naming a missing recipe is refused" "$PFIX" "$RFIX" \
   'has no recipes/does-not-exist.toml' profile show norecipe
 
-expect_fail "the common layer is not a profile" "$PFIX" "$RFIX" "'common' is the shared" \
-  profile show common
+cat > "$PFIX/selfish.toml" <<'EOF'
+name = "selfish"
+inherit = "selfish"
+EOF
+expect_fail "a profile that inherits itself is refused" "$PFIX" "$RFIX" 'closes a loop' \
+  profile show selfish
+
+cat > "$PFIX/loop-a.toml" <<'EOF'
+name = "loop-a"
+inherit = "loop-b"
+EOF
+cat > "$PFIX/loop-b.toml" <<'EOF'
+name = "loop-b"
+inherit = "loop-a"
+EOF
+expect_fail "two layers inheriting each other are refused" "$PFIX" "$RFIX" \
+  'closes a loop' profile show loop-a
+
+cat > "$PFIX/orphan.toml" <<'EOF'
+name = "orphan"
+inherit = "nosuchlayer"
+EOF
+expect_fail "inheriting a layer that does not exist is refused" "$PFIX" "$RFIX" \
+  'there is no profiles/nosuchlayer.toml' profile show orphan
+
+cat > "$PFIX/badinherit.toml" <<'EOF'
+name = "badinherit"
+inherit = 3
+EOF
+expect_fail "a non-string inherit is refused" "$PFIX" "$RFIX" 'inherit must be a layer name' \
+  profile show badinherit
+
+cat > "$PFIX/tomlname.toml" <<'EOF'
+name = "tomlname"
+inherit = "essential.toml"
+EOF
+expect_fail "an inherit with a filename is refused" "$PFIX" "$RFIX" \
+  'not a path or a filename' profile show tomlname
+
+cat > "$PFIX/bare.toml" <<'EOF'
+name = "bare"
+EOF
+expect_fail "a profile with layers and no packages of its own is refused" "$PFIX" "$RFIX" \
+  'package set is empty' profile show bare
+
 expect_fail "a missing profile is reported" "$PFIX" "$RFIX" 'no such file' profile show nosuch
 
 echo "--- board"

@@ -1,11 +1,12 @@
 # Profile: headless
 #
-# The common layer and nothing else: ssh, DHCP, the BSP kernel and the board
+# The essential layer and nothing else: ssh, DHCP, the BSP kernel and the board
 # services, no GPU userspace and no locally built software. This is what the
 # project shipped before profiles existed, and it keeps the unsuffixed image
 # filename.
 #
-# Every key is omitted on purpose: an omitted key means "no difference from
-# common". It is the default profile, so no flag is needed to build it.
+# Every list is empty on purpose: the image is exactly what `essential` says. It
+# is the default profile, so no flag is needed to build it.
 
 name = "headless"
+inherit = "essential"

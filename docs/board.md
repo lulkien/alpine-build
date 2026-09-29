@@ -9,7 +9,7 @@ Both are data, resolved by the same tool, and both are common-plus-delta:
 ```
 board/common/board.toml                    what every platform shares
 board/platform/<name>/board.toml           one machine (name = the directory)
-profiles/common.toml + profiles/<name>.toml  the software half
+profiles/essential.toml + a profile that inherits it  the software half
 ```
 
 `tools/buildcfg.py board show <name> --emit env > build/board.env` resolves the
