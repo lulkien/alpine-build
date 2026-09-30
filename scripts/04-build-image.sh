@@ -110,7 +110,7 @@ ls -l /mnt/target/boot /mnt/target/boot/extlinux
 # list can drift from the files it describes.
 CHECKS=("/lib/modules/$KREL" "/boot/vmlinuz-$KREL" "/boot/dtbs/allwinner/$BOARD_DTB"
         "/boot/dtbs/allwinner/$BOARD_BOOT_DTB" "/boot/extlinux/extlinux.conf"
-        "/sbin/init" "/bin/busybox.static" "/boot/flash-initramfs.gz")
+        "/sbin/init" "/bin/busybox.static" "/boot/ram-initramfs.gz")
 for overlay in "${BOARD_OVERLAYS[@]}"; do
   CHECKS+=("/boot/dtbs/allwinner/overlay/$(basename "${overlay%.dtso}").dtbo")
 done
@@ -214,18 +214,29 @@ echo "    board '$BOARD_MACHINE' (kernel $KREL): ${#PROFILE_APK_ADD[@]} packages
 echo "--- required paths present"
 grep -q '^LABEL debug$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: debug label missing from extlinux.conf"; exit 1; }
 grep -q '^LABEL flash$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: flash label missing from extlinux.conf"; exit 1; }
-grep -q '^DEFAULT bsp$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: the image must boot bsp, not flash"; exit 1; }
-ir_listing=$'\n'$(gzip -dc "$WORK/rootfs/boot/flash-initramfs.gz" | cpio -t 2>/dev/null)$'\n'
-case "$ir_listing" in
-  *$'\n'init$'\n'*) ;;
-  *) echo "FAIL: flash-initramfs.gz has no /init" >&2; exit 1 ;;
-esac
-{ [ -x "$WORK/rootfs/usr/sbin/resize2fs" ] || [ -x "$WORK/rootfs/sbin/resize2fs" ]; } || { echo "FAIL: resize2fs missing from the rootfs (no card expansion possible)"; exit 1; }
+grep -q '^LABEL grow$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: grow label missing from extlinux.conf"; exit 1; }
+grep -q '^DEFAULT bsp$' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: the image must boot bsp, not flash or grow"; exit 1; }
+# Both modes boot the same RAM initramfs; the labels are what select the mode, so
+# a drift between them is a boot that does the wrong thing rather than a failure.
+flash_initrd=$(awk '$1 == "LABEL" { inl = ($2 == "flash") } inl && $1 == "INITRD" { print $2; exit }' "$WORK/rootfs/boot/extlinux/extlinux.conf")
+grow_initrd=$(awk '$1 == "LABEL" { inl = ($2 == "grow") } inl && $1 == "INITRD" { print $2; exit }' "$WORK/rootfs/boot/extlinux/extlinux.conf")
+[ -n "$flash_initrd" ] && [ "$flash_initrd" = "$grow_initrd" ] ||
+  { echo "FAIL: flash and grow labels boot different initramfs ('$flash_initrd' vs '$grow_initrd')"; exit 1; }
+[ -f "/mnt/target$flash_initrd" ] || { echo "FAIL: $flash_initrd (both labels) is not on the image"; exit 1; }
+grep -q 'ram_mode=flash' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: the flash label does not ask for flash mode"; exit 1; }
+grep -q 'ram_mode=grow' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: the grow label does not ask for grow mode"; exit 1; }
+ir_listing=$'\n'$(gzip -dc "$WORK/rootfs$flash_initrd" | cpio -t 2>/dev/null)$'\n'
+for entry in init bin/grow-rootfs sbin/e2fsck usr/sbin/resize2fs; do
+  case "$ir_listing" in
+    *$'\n'"$entry"$'\n'*) ;;
+    *) echo "FAIL: the RAM initramfs has no $entry" >&2; exit 1 ;;
+  esac
+done
+{ [ -x "$WORK/rootfs/usr/sbin/resize2fs" ] || [ -x "$WORK/rootfs/sbin/resize2fs" ]; } || { echo "FAIL: resize2fs missing from the rootfs (grow mode runs it from the initramfs)"; exit 1; }
 [ -x "$WORK/rootfs/etc/init.d/growfs" ] || { echo "FAIL: growfs service missing from the rootfs"; exit 1; }
-[ -L "$WORK/rootfs/etc/runlevels/boot/growfs" ] || { echo "FAIL: growfs is not enabled in the boot runlevel"; exit 1; }
+[ -L "$WORK/rootfs/etc/runlevels/default/growfs" ] || { echo "FAIL: growfs is not enabled in the default runlevel"; exit 1; }
 [ -x "$WORK/rootfs/etc/init.d/mdev-hotplug" ] || { echo "FAIL: mdev-hotplug service missing (hotplug would be dead)"; exit 1; }
 [ -L "$WORK/rootfs/etc/runlevels/boot/mdev-hotplug" ] || { echo "FAIL: mdev-hotplug is not enabled in the boot runlevel"; exit 1; }
-grep -q 'read_mbr_entry' "$WORK/rootfs/boot/flash-initramfs.gz" 2>/dev/null || true
 echo "--- extlinux.conf"
 cat /mnt/target/boot/extlinux/extlinux.conf
 echo "--- u-boot magic on image"

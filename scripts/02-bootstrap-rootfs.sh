@@ -54,9 +54,10 @@ echo "--- apk add"
 # (ssh server and clients, DHCP client, tzdata, dosfstools, alpine-conf,
 # linux-lts, the mesa userspace) come from the profile in stage 2.
 #
-# busybox-static and cpio feed the flash initramfs, e2fsprogs-extra provides the
-# resize2fs the growfs service runs, alpine-base is the rootfs floor. Removing
-# one of those does not produce a smaller image, it produces a broken build.
+# busybox-static and cpio feed the RAM initramfs, e2fsprogs-extra provides the
+# resize2fs grow mode runs from inside it, alpine-base is the rootfs floor.
+# Removing one of those does not produce a smaller image, it produces a broken
+# build.
 chroot "$ROOT" /sbin/apk add --no-cache \
   alpine-base e2fsprogs e2fsprogs-extra busybox-static cpio
 

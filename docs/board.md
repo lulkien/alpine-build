@@ -45,7 +45,8 @@ ships with, and the vendor's own overlay text in the bare `/fragment@0` form
 ```
 board/common/board.toml
 board/common/runtime/root/         files copied into the image rootfs
-board/common/runtime/initramfs/    files copied into the flash-mode initramfs
+board/common/runtime/initramfs/    files copied into the RAM initramfs, whose two
+                                    boot modes (flash, grow) run from it
 ```
 
 The runtime trees are conventions rather than keys, and they **mirror the
@@ -54,10 +55,12 @@ destination**:
 ```
 runtime/root/usr/sbin/ota-flash                -> /usr/sbin/ota-flash
 runtime/root/etc/init.d/growfs                 -> /etc/init.d/growfs
-runtime/root/etc/runlevels/boot/growfs         -> a real symlink, enabled at boot
+runtime/root/etc/runlevels/default/growfs      -> a real symlink, enabled at boot
 runtime/root/root/.ssh/authorized_keys         -> /root/.ssh/authorized_keys
-runtime/initramfs/init                         -> /init in the flash initramfs
+runtime/initramfs/init                         -> /init in the RAM initramfs
 runtime/initramfs/bin/bmap-write               -> /bin/bmap-write there
+runtime/initramfs/bin/grow-rootfs              -> /bin/grow-rootfs there, and the
+                                                  script /init execs for grow mode
 ```
 
 So nothing writes a destination down: stage 03 copies the trees with modes and

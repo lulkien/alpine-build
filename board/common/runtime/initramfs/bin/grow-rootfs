@@ -1,0 +1,169 @@
+#!/bin/busybox sh
+# grow-rootfs: the second mode of this RAM initramfs - resize the root filesystem
+# with nothing mounted from the card.
+#
+# Reached from /init when the kernel command line asks for it (ram_mode=grow,
+# which is what the `grow` label carries). The filesystem is NOT mounted while it
+# is resized, and that is the whole point: the online path - resize2fs on a
+# mounted root, which commits through the kernel's EXT4_IOC_RESIZE_FS - wedges
+# this board (unreachable within ~15 s of starting, then a watchdog reset loop,
+# the filesystem unchanged and needing journal replay). The same resize with the
+# filesystem unmounted runs entirely in userspace, never enters that path, and
+# finished in about fifteen seconds for 4 GiB -> 14.6 GiB.
+#
+# Sequence: find the root filesystem -> e2fsck -f -> resize2fs -> mount, record
+# what happened in /var/log/grow.log, hand the boot back to the installed OS
+# (extlinux.conf.bak) -> reboot.
+#
+# Booted by hand from the menu, with no parameters at all, this is still safe:
+# resize2fs on a filesystem that already fills its partition reports there is
+# nothing to do, and the mode reboots back into the OS.
+#
+# Everything needed is in the archive: this script, the static busybox, e2fsck,
+# resize2fs, tune2fs, and the musl loader with the libraries those two use.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+LOG=/tmp/grow.log
+LABEL=${GROW_LABEL:-rootfs}
+DEV=""
+SAMPLER=""
+
+say() {
+	echo "grow> $*"
+	echo "grow> $*" >> "$LOG"
+}
+
+note() { # progress that must not pollute find_root_fs's stdout
+	echo "grow> $*" >&2
+	echo "grow> $*" >> "$LOG"
+}
+
+find_root_fs() {
+	# Partitions only: /sys/class/block/<name>/partition exists for a partition and
+	# for nothing else, so this finds mmcblk2p1, vda1 or sda1 without ever guessing
+	# at an index - on this board the SD and the eMMC swap indices between boots.
+	# The ext4 volume label at partition offset 1144 is s_volume_name.
+	seen=0
+	for d in /sys/class/block/*; do
+		[ -f "$d/partition" ] || continue
+		p="/dev/$(basename "$d")"
+		[ -b "$p" ] || continue
+		seen=$((seen + 1))
+		vol=$(dd if="$p" bs=1 skip=1144 count=16 2>/dev/null | tr -d '\000')
+		note "candidate $p: ext4 label '$vol'"
+		if [ "$vol" = "$LABEL" ]; then
+			echo "$p"
+			return 0
+		fi
+	done
+	# An empty failure says nothing, and this runs on a console nobody can query
+	# afterwards: say what was there instead.
+	if [ "$seen" = 0 ]; then
+		note "no partitions visible at all (/sys/class/block): is the disk driver loaded?"
+	fi
+	return 1
+}
+
+sample_writes() { # progress for a resize that prints nothing until it is done
+	stat="/sys/class/block/$(basename "$1")/stat"
+	[ -r "$stat" ] || return 0
+	(
+		first=$(cat "$stat" 2>/dev/null | awk '{ print $7 }')
+		first=${first:-0}
+		while :; do
+			sleep 5
+			set -- $(cat "$stat" 2>/dev/null)
+			now=${7:-}
+			[ -n "$now" ] || continue
+			say "working: $(( (now - first) * 512 / 1048576 )) MiB written since the resize started"
+		done
+	) &
+	SAMPLER=$!
+}
+
+restore_and_reboot() { # $1 = reason; the boot configuration is what makes this a one-boot detour
+	say "$1"
+	mkdir -p /mnt
+	if mount -t ext4 "$DEV" /mnt 2>/dev/null; then
+		if [ -f /mnt/boot/extlinux/extlinux.conf.bak ]; then
+			cp -f /mnt/boot/extlinux/extlinux.conf.bak /mnt/boot/extlinux/extlinux.conf &&
+				say "boot configuration restored from extlinux.conf.bak"
+		else
+			say "no extlinux.conf.bak on $DEV: leaving the boot configuration alone"
+		fi
+		if [ -d /mnt/var/log ]; then
+			echo "--- grow-rootfs gave up ---" >> /mnt/var/log/grow.log 2>/dev/null
+			cat "$LOG" >> /mnt/var/log/grow.log 2>/dev/null
+		fi
+		sync
+		umount /mnt
+	else
+		say "cannot mount $DEV: the boot configuration is not restored"
+	fi
+	say "rebooting"
+	sync
+	sleep 2
+	reboot -f
+	while true; do sleep 3600; done
+}
+
+say "grow-rootfs: cold resize of the filesystem labelled $LABEL"
+
+DEV=$(find_root_fs) || restore_and_reboot "no ext4 filesystem labelled $LABEL on any partition"
+say "filesystem: $DEV, partition $(($(cat "/sys/class/block/$(basename "$DEV")/size" 2>/dev/null) * 512 / 1048576)) MiB"
+
+# ------------------------------------------------------------------- the work
+say "e2fsck -f on the unmounted filesystem"
+e2fsck -f -y "$DEV" >> "$LOG" 2>&1
+E2RC=$?
+# 0 = clean, 1 = repaired. 2 or worse means there is something here a resize must
+# not be built on top of, and the box is better off booting the OS and saying so.
+say "e2fsck exit $E2RC (0 clean, 1 repaired, 2+ needs attention)"
+if [ "$E2RC" -ge 2 ]; then
+	tail -20 "$LOG"
+	restore_and_reboot "e2fsck cannot make $DEV safe (exit $E2RC)"
+fi
+
+sample_writes "$DEV"
+say "resize2fs $DEV"
+resize2fs "$DEV" >> "$LOG" 2>&1
+RC=$?
+[ -n "$SAMPLER" ] && kill "$SAMPLER" 2>/dev/null
+say "resize2fs exit $RC"
+
+# -------------------------------------------------------------------- results
+blocks=$(tune2fs -l "$DEV" 2>/dev/null | awk '/^Block count:/ { print $3; exit }')
+say "superblock block count now: ${blocks:-unknown}"
+
+mkdir -p /mnt
+if mount -t ext4 "$DEV" /mnt 2>/dev/null; then
+	say "mounted: $(df -h /mnt 2>/dev/null | awk 'NR == 2 { print $2 " total, " $4 " free }')"
+	[ -d /mnt/var/log ] || mkdir -p /mnt/var/log
+	echo "--- grow-rootfs run ($(date -u +%Y-%m-%dT%H:%M:%SZ), resize2fs exit $RC) ---" >> /mnt/var/log/grow.log
+	cat "$LOG" >> /mnt/var/log/grow.log
+	if [ -f /mnt/boot/extlinux/extlinux.conf.bak ]; then
+		cp -f /mnt/boot/extlinux/extlinux.conf.bak /mnt/boot/extlinux/extlinux.conf &&
+			say "boot configuration restored from extlinux.conf.bak"
+	else
+		say "no extlinux.conf.bak: leaving the boot configuration alone"
+	fi
+	if [ "$RC" = 0 ]; then
+		# The resize is what the arming service was waiting for: without this the
+		# service would arm another grow boot on every start.
+		rm -f /mnt/var/lib/growfs/attempts
+		say "arming counter cleared"
+	fi
+	sync
+	umount /mnt
+	sync
+else
+	say "cannot mount $DEV read-write: nothing recorded on the filesystem"
+fi
+
+say "rebooting"
+sync
+sleep 2
+reboot -f
+while true; do sleep 3600; done

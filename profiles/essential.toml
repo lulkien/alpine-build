@@ -27,8 +27,8 @@
 #   services   scripts/03-configure-rootfs.sh
 #
 # Deliberately NOT here: the packages the build itself needs rather than the
-# image — busybox-static and cpio feed the flash initramfs, e2fsprogs-extra
-# provides the resize2fs the growfs service runs, alpine-base is the rootfs
+# image — busybox-static and cpio feed the RAM initramfs, e2fsprogs-extra provides
+# the resize2fs that grow mode runs from inside it, alpine-base is the rootfs
 # floor. Removing those does not produce a smaller image, it produces a broken
 # build, so they stay in scripts/02-bootstrap-rootfs.sh.
 
@@ -55,6 +55,13 @@ apk_remove = []
 # <runlevel>:<service>; a bare name means the default runlevel. growfs and
 # mdev-hotplug are board services installed by stage 2, not by a package.
 #
+# growfs is in the default runlevel because all it does now is arm one grow boot
+# and reboot: on a machine whose root filesystem is smaller than its partition it
+# saves the boot configuration, points DEFAULT at the `grow` label and reboots,
+# and the grow mode (the other mode of the same RAM initramfs) does the resize
+# with nothing mounted. The resize itself used to run here, online, and wedged
+# this board; see /etc/init.d/growfs for that.
+#
 # seedrng, not urandom: Alpine 3.22 has no /etc/init.d/urandom, and the previous
 # hardcoded list enabled service names with a silent `[ -x ]` guard, so a name
 # that did not exist was simply never enabled. The profile list is checked
@@ -72,9 +79,9 @@ services = [
     "boot:syslog",
     "boot:swclock",
     "boot:hostname",
-    "boot:growfs",
     "boot:mdev-hotplug",
     "default:networking",
+    "default:growfs",
     "default:dropbear",
     "default:crond",
     "default:ntpd",

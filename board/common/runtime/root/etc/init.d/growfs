@@ -1,22 +1,37 @@
 #!/sbin/openrc-run
-# Grow the root filesystem to fill its partition — once, on the first boot after
-# a flash.
+# Arm one grow boot when the root filesystem is smaller than its partition.
 #
-# The image is built for a fixed size, but the flasher extends the root
-# partition to the end of the card before it reboots. This boot is the one that
-# sees the bigger partition (the kernel reads the table fresh), so this is where
-# the filesystem can be grown into it. Growing a mounted ext4 is supported.
+# This service used to grow the filesystem itself, with resize2fs on the mounted
+# root. That wedges this board: the online path commits through the kernel's
+# EXT4_IOC_RESIZE_FS, and the box stopped answering within ~15 s of starting it,
+# came back in a watchdog reset loop, and left the filesystem unchanged and
+# needing journal replay. The resize now happens in the RAM-only initramfs (the
+# `grow` label), where nothing is mounted from the card and the work never enters
+# that path: seconds, on the same card, for the same job.
+#
+# All that is left here is the decision and the arming — compare the filesystem
+# with its partition, and when there is room, save the boot configuration, point
+# DEFAULT at `grow`, count the attempt and reboot. That boot clears the counter on
+# success and restores the boot configuration either way, so this stays a
+# one-boot detour, and the counter keeps a resize that cannot finish from looping.
 #
 # Idempotent by comparison rather than by a marker file: when the filesystem
-# already fills its partition this reports so and touches nothing. Doing the
-# same from a running system without a reboot is not possible — the partition
-# table cannot be re-read while the rootfs on it is mounted.
+# already fills its partition this reports so and touches nothing.
+#
+# It runs in the default runlevel on purpose. Arming is a reboot, and a reboot is
+# better taken with the system up (logs flushed, /var written) than from midway
+# through the boot runlevel.
 
-description="Grow the root filesystem to fill the card"
+description="Grow the root filesystem into its partition on the next boot"
+
+CONF=/boot/extlinux/extlinux.conf
+BAK=$CONF.bak
+INITRD=/boot/ram-initramfs.gz
+ATTEMPTS=/var/lib/growfs/attempts
+MAX_ATTEMPTS=2
 
 depend() {
 	after root localmount
-	before net
 }
 
 root_device() {
@@ -56,10 +71,63 @@ start() {
 		return 0
 	fi
 
-	ebegin "growing $dev from $((fs_bytes / 1048576)) MiB to $((part_bytes / 1048576)) MiB"
-	resize2fs "$dev" || {
-		eend 1 "resize2fs failed on $dev"
+	# There is room. Everything the grow boot needs has to be in this image.
+	[ -f "$CONF" ] || {
+		eend 1 "no $CONF: this image has no boot menu to arm"
 		return 1
 	}
-	eend 0 "root filesystem now fills the card"
+	grep -q '^LABEL grow$' "$CONF" || {
+		eend 1 "no grow label in $CONF: this image cannot grow the filesystem"
+		return 1
+	}
+	[ -f "$INITRD" ] || {
+		eend 1 "$INITRD is missing: this image cannot grow the filesystem"
+		return 1
+	}
+	# Never step on a mode that is already armed: a `flash` default waiting for the
+	# next boot belongs to ota-flash, and its backup is what restores it.
+	current=$(awk '$1 == "DEFAULT" { print $2; exit }' "$CONF")
+	case "$current" in
+	grow | flash)
+		eend 1 "DEFAULT is '$current': another boot mode is armed, leaving it alone"
+		return 1
+		;;
+	esac
+
+	attempts=$(cat "$ATTEMPTS" 2>/dev/null)
+	case "$attempts" in
+	'' | *[!0-9]*) attempts=0 ;;
+	esac
+	if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+		eend 1 "gave up after $attempts attempts: /var/log/grow.log has the last one; remove $ATTEMPTS to try again"
+		return 1
+	fi
+
+	ebegin "arming one grow boot: $((fs_bytes / 1048576)) MiB -> $((part_bytes / 1048576)) MiB (attempt $((attempts + 1)) of $MAX_ATTEMPTS)"
+	cp -f "$CONF" "$BAK" || {
+		eend 1 "cannot write $BAK"
+		return 1
+	}
+	awk '$1 == "DEFAULT" && !done { print "DEFAULT grow"; done = 1; next } { print }' \
+		"$CONF" > "$CONF.new" || {
+		eend 1 "cannot edit $CONF"
+		return 1
+	}
+	[ "$(awk '$1 == "DEFAULT" { print $2; exit }' "$CONF.new")" = grow ] || {
+		eend 1 "the edited $CONF does not default to grow"
+		rm -f "$CONF.new"
+		return 1
+	}
+	cat "$CONF.new" > "$CONF" || {
+		eend 1 "cannot write $CONF"
+		rm -f "$CONF.new"
+		return 1
+	}
+	rm -f "$CONF.new"
+	mkdir -p "$(dirname "$ATTEMPTS")"
+	echo "$((attempts + 1))" > "$ATTEMPTS"
+	sync
+	eend 0
+	einfo "rebooting into grow mode; that boot resizes with nothing mounted and restores $BAK itself"
+	reboot
 }

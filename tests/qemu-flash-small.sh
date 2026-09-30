@@ -22,7 +22,7 @@ docker run --rm --privileged -e POISON="${POISON:-0}" -v /dev:/dev -v "$SCRATCH"
 	alpine:3.22 sh -euxc '
 apk add --no-cache qemu-system-aarch64 python3 cpio gzip coreutils >/dev/null 2>&1
 mkdir -p /t/ir/bin /t/ir/dev /t/ir/proc /t/ir/sys /t/ir/tmp /t/ir/lib/modules/$KREL
-( cd /t/ir && gzip -dc /boot/flash-initramfs.gz | cpio -idmu --quiet )
+( cd /t/ir && gzip -dc /boot/ram-initramfs.gz | cpio -idmu --quiet )
 for m in failover net_failover virtio_pci_modern_dev virtio_pci_legacy_dev virtio_pci virtio_blk virtio_net; do
   src=$(find /mods -name "$m.ko" | head -1); [ -n "$src" ] && cp "$src" /t/ir/lib/modules/$KREL/
 done

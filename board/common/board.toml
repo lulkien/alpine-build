@@ -13,7 +13,8 @@
 #
 #   board/common/runtime/root/       copied into the image rootfs, each file's
 #                                    path mirroring where it lands on the board
-#   board/common/runtime/initramfs/  copied into the flash-mode initramfs, same idea
+#   board/common/runtime/initramfs/  copied into the RAM initramfs, same idea; both
+#                                    boot modes (flash, grow) run from that archive
 #
 # A platform may add its own runtime/{root,initramfs} tree the same way; both are
 # copied, the platform's after the common one.

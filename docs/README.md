@@ -79,9 +79,12 @@ LABEL debug        # explicit /dev/mmcblk0p1, no rootwait, loglevel=8
          panic=15 console=ttyS0,115200 console=tty0 ...
 LABEL mainline     # Alpine 6.12.110, no wired Ethernet
   LINUX /boot/vmlinuz-lts
-LABEL flash        # flash mode: RAM-only initramfs, writes an image, no OS
+LABEL flash        # flash mode: RAM initramfs, writes an image, no OS
   LINUX /boot/vmlinuz-6.18.53-ophub
-  INITRD /boot/flash-initramfs.gz
+  INITRD /boot/ram-initramfs.gz
+LABEL grow         # grow mode: the same initramfs, resizes the rootfs cold
+  LINUX /boot/vmlinuz-6.18.53-ophub
+  INITRD /boot/ram-initramfs.gz
 ```
 
 `root=PARTUUID=` (not `UUID=`) is used so the same image boots from SD and from
@@ -134,8 +137,11 @@ and silently, so nothing is logged.
 
 Two pieces ship in the image:
 
-- `/usr/sbin/ota-flash` (source `board/runtime/ota-flash`) arms the next boot.
-- a `flash` extlinux label and `/boot/flash-initramfs.gz` are flash mode itself.
+- `/usr/sbin/ota-flash` (source `board/common/runtime/root/usr/sbin/ota-flash`)
+  arms the next boot.
+- `/boot/ram-initramfs.gz` is the RAM initramfs both boot modes run from; the
+  `flash` and `grow` extlinux labels are what select the mode, with
+  `ram_mode=flash` and `ram_mode=grow`.
 
 `ota-flash <url>` writes nothing. It checks the URL and its sidecars, bakes the
 image URL, its sha256, size, bmap and the target disk into the `flash` label,
@@ -146,7 +152,8 @@ the point of the design. Writing the boot medium from the running OS put ext4
 writeback inside the image being written, and the flasher's own executables were
 read back from the blocks `dd` was overwriting.
 
-Flash mode sequence (`board/runtime/flash-init`): read the `ota_*` parameters from the
+Flash mode sequence (`board/common/runtime/initramfs/init`, which dispatches between
+the two modes): read the `ota_*` parameters from the
 kernel command line, bring `eth0` up over DHCP, fetch the bmap, stream the `.gz`
 through gzip writing only the mapped ranges, verify every range by reading it
 back, check the u-boot magic at KiB 8, reboot. The freshly written image has
@@ -233,17 +240,38 @@ every byte.
 
 ### Filling the card
 
-The image is built at a fixed 4096 MiB. On a bigger card, flash mode hands the
-rest of the card to the root partition after the write has been verified — one
-4-byte write to the partition table — and reboots. That order is what makes it
-possible: the table can only be re-read while nothing is mounted from it, so it
-has to happen in flash mode rather than from the running system. The flasher
-grows the partition only; the filesystem is grown by the image itself on the
-next boot, by the `growfs` service in the boot runlevel. It compares the
-filesystem size (`tune2fs -l`) with its partition's size
-(`/sys/class/block/*/size`) and runs `resize2fs` only when there is something to
-grow — growing a mounted ext4 is supported, and the comparison makes it a no-op
-on every later boot. `ota_fill=0` on the `flash` label skips the extension.
+The image is built at a fixed 4096 MiB. On a bigger card the filesystem is grown
+into the rest of it, and that takes two boots because each half of the job can
+only be done while nothing is mounted from the card:
+
+- **the partition**, extended by flash mode after the write has been verified —
+  one 4-byte write to the partition table — because the kernel only re-reads the
+  table when no filesystem from that disk is mounted;
+- **the filesystem**, grown by the `grow` boot mode, which is the other mode of
+  the same RAM initramfs: `e2fsck -f`, then `resize2fs` on the unmounted
+  partition.
+
+The `growfs` service in the default runlevel decides and arms the second boot. It
+compares the filesystem size (`tune2fs -l`) with its partition's size
+(`/sys/class/block/*/size`), and when there is room it saves
+`/boot/extlinux/extlinux.conf.bak`, points `DEFAULT` at the `grow` label, counts
+the attempt and reboots. Grow mode restores that backup before it reboots, so the
+box comes back to the installed system either way, and `/var/log/grow.log` on the
+card records what happened. It gives up after two attempts
+(`/var/lib/growfs/attempts` — remove that file to retry), so a resize that cannot
+finish does not loop.
+
+The service used to do the resize itself, with `resize2fs` on the mounted root.
+That is the online path, and it commits through the kernel's
+`EXT4_IOC_RESIZE_FS`: on this board the box stopped answering within ~15 s of
+starting it, came back in a watchdog reset loop, and left the filesystem
+unchanged and needing journal replay. The same resize with nothing mounted took
+seconds on the same card. That is why the two halves are separate boots instead
+of one boot and one call — and why the equivalent online path is worth refusing
+by default until it has been proven on the machine in question.
+
+`ota_fill=0` on the `flash` label skips the partition extension, and then there is
+nothing for grow mode to do.
 
 `tests/qemu-flash-mode.sh` exercises both paths for real without the board. It
 boots the image's own kernel and initramfs on QEMU's `virt` machine with a disk
@@ -251,6 +279,12 @@ file as `ota_target` and an HTTP server standing in for the NAS, then checks tha
 a successful flash leaves the target byte-identical to the image, and that an
 abort before the first byte restores the boot configuration from the backup and
 leaves the rest of the target untouched.
+
+`tests/qemu-grow-mode.sh` covers the other mode without the board: it boots the
+RAM initramfs with `ram_mode=grow` against a disk whose root filesystem is smaller
+than its partition, and checks that the guest grew it to fill the partition,
+restored the boot configuration from `extlinux.conf.bak`, cleared the arming
+counter, and wrote `/var/log/grow.log`.
 
 `tests/qemu-flash-small.sh` runs the same chain against a 16 MiB fixture in
 seconds, which is the one to run on every change. Its target is larger than the
@@ -527,7 +561,14 @@ right.
   kernel; pin or remove `linux-lts` if a future upgrade should not touch
   `/boot`.
 - eMMC install: flash the same image to eMMC (`dd` from the running system or
-  the vendor tool) — `root=PARTUUID=abcd1234-01` resolves identically there.
+  the vendor tool) — `root=PARTUUID=abcd1234-01` resolves identically there. Note
+  what a plain image copy does *not* do: it carries the image's own partition
+  table, so a 14.6 GiB chip keeps a 4096 MiB partition and `growfs` reports there
+  is nothing to grow (`df` shows 3.9 G). Flash mode is the path that extends the
+  partition (`ota_fill=1`); for a dd'ed medium, extend it by hand — the same
+  4-byte MBR write — and reboot, and grow mode does the rest. Two media flashed
+  from one image also share `root=PARTUUID=abcd1234-01`, so blank the one you are
+  not booting: zero its first 16 MiB, MBR and u-boot and ext4 superblock alike.
 - The 100M link is the piece to watch on first boot: if it stays down, compare
   `ip link`/`ethtool` against the Armbian install and tune the RMII delays in
   the DTB (the vendor DTB may need `allwinner,rx/tx-delay-ps` or an

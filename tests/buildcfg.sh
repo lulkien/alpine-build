@@ -53,7 +53,7 @@ simple-graphics" "$(python3 "$TOOL" profile list)"
 
 headless=$(python3 "$TOOL" profile show headless)
 assert_match "headless carries linux-lts" "$headless" '^  linux-lts$'
-assert_match "headless enables growfs" "$headless" '^  boot:growfs$'
+assert_match "headless enables growfs" "$headless" '^  default:growfs$'
 assert_no_match "headless has no mesa" "$headless" '^  mesa-'
 assert_no_match "headless builds nothing" "$headless" '^  simple-graphics-controller$'
 

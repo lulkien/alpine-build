@@ -1,7 +1,8 @@
 #!/bin/bash
 # qemu-flash-mode.sh: end-to-end test of flash mode without the board.
 #
-# Boots the image's own kernel and flash-initramfs.gz on QEMU's "virt" machine
+# Boots the image's own kernel and the RAM initramfs (ram-initramfs.gz) in flash
+# mode on QEMU's "virt" machine
 # with a serial console, a NIC that comes up as eth0, and a disk file standing in
 # for the SD card. It then lets flash mode do the real thing: fetch the image and
 # its bmap over HTTP, write the target, verify. Two cases:
@@ -50,7 +51,7 @@ mkdir -p /t && cd /t
 
 echo "=== test initramfs: shipped flash-init plus the virtio modules"
 mkdir -p /t/ir
-( cd /t/ir && gzip -dc /boot/flash-initramfs.gz | cpio -idmu --quiet )
+( cd /t/ir && gzip -dc /boot/ram-initramfs.gz | cpio -idmu --quiet )
 ls /t/ir
 mkdir -p /t/ir/lib/modules/$KREL
 for m in failover net_failover virtio_pci_modern_dev virtio_pci_legacy_dev virtio_pci virtio_blk virtio_net; do

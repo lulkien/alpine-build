@@ -1,13 +1,22 @@
 #!/bin/busybox sh
-# flash-init: /init of the flash initramfs.
+# init: /init of the RAM initramfs. It carries two boot modes, and both act on a
+# boot medium with nothing mounted from it:
 #
-# Runs from RAM only. No filesystem is mounted from the SD card while this script
-# writes to the SD card, which is the whole point: the write cannot collide with a
-# live rootfs, and no executable or script this runs is read back from the medium
-# being overwritten.
+#   flash mode (ota_url=... below)   stream an image and write it, then hand the
+#                                    boot over to what was written
+#   grow mode  (ram_mode=grow)       resize the root filesystem cold - see
+#                                    bin/grow-rootfs for why that must not be
+#                                    done from the running OS on this hardware
 #
-# The OS-side ota-flash arms this by baking parameters into the `flash` extlinux
-# label and rebooting into it:
+# Either way this runs from RAM only. No filesystem is mounted from the card while
+# the card is written or resized, which is the point in both modes: the work cannot
+# collide with a live rootfs, and no executable or script this runs is read back
+# from the medium being changed.
+#
+# The OS side arms flash mode by baking parameters into the `flash` extlinux label
+# and rebooting into it (ota-flash), and grow mode by pointing DEFAULT at the
+# `grow` label (the growfs service, when the filesystem is smaller than its
+# partition).
 #
 #   ota_url=http://host/alpine-<board>-<ver>.img.gz   image to stream
 #   ota_sha256=<hex>       expected sha256 of the raw image
@@ -19,6 +28,12 @@
 #   ota_timeout=<seconds>                             read timeout for the image stream
 #   ota_fill=0|1                                      extend the root partition to
 #                                                    fill the card (default 1)
+#
+#   ram_mode=flash|grow                  which of the two modes this boot is; when
+#                                        it is absent, ota_url decides, and a boot
+#                                        with neither is grow mode
+#   grow_label=<ext4 volume label>       which filesystem grow mode resizes
+#                                        (default: rootfs)
 #
 # Sequence: parameters -> DHCP -> bmap -> write -> verify -> reboot.
 # Before the first byte is written, any failure restores the saved extlinux.conf
@@ -57,6 +72,8 @@ OTA_ROOTPART=$(cmdline_value ota_rootpart)
 OTA_MODE=$(cmdline_value ota_mode)
 OTA_HOSTNAME=$(cmdline_value ota_hostname)
 OTA_TIMEOUT=$(cmdline_value ota_timeout)
+RAM_MODE=$(cmdline_value ram_mode)
+GROW_LABEL=$(cmdline_value grow_label)
 # The stream can be quiet for a while on a slow or heavily emulated link without
 # being dead, so it gets a much longer read timeout than the small metadata
 # fetches. Short here means "abort and keep the installed system".
@@ -112,6 +129,20 @@ give_up() { # $1 = reason; the disk has been touched, nothing can recover it her
 	sync
 	while true; do sleep 3600; done
 }
+
+# --------------------------------------------------------------- which mode
+# Two modes share this initramfs. ram_mode is explicit and is what both labels
+# carry; without it, ota_url decides, which is what an older image's flash label
+# has; a RAM boot with neither is read as a grow request, so picking the `grow`
+# label by hand at the menu does the obvious thing.
+GROW_LABEL=${GROW_LABEL:-rootfs}
+export GROW_LABEL
+if [ "${RAM_MODE:-}" = grow ] || { [ -z "${RAM_MODE:-}" ] && [ -z "$OTA_URL" ]; }; then
+	log "grow mode: resizing the filesystem labelled $GROW_LABEL with nothing mounted"
+	exec /bin/grow-rootfs
+elif [ "${RAM_MODE:-}" != flash ]; then
+	log "ram_mode is '${RAM_MODE:-}' and ota_url is set: running flash mode"
+fi
 
 # ------------------------------------------------------------- sanity checks
 [ -n "$OTA_URL" ] || restore_and_reboot "no ota_url on the kernel command line"
@@ -270,9 +301,10 @@ fi
 # ------------------------------------------------- and the rest of the card
 # The image's partition is image-sized, so a bigger card keeps its extra space
 # unusable. Extend the partition here, before the reboot: the kernel reads the
-# table fresh on the next boot, and the OS then grows the filesystem to match
-# (its growfs service, once). Doing it from the running OS is not possible, the
-# table cannot be re-read while the rootfs on it is mounted.
+# table fresh on the next boot, and the OS then arms one grow boot to grow the
+# filesystem into it (the growfs service, then the grow label - the other mode of
+# this same initramfs). Doing it from the running OS is not possible, the table
+# cannot be re-read while the rootfs on it is mounted.
 if [ "${OTA_FILL:-1}" = 1 ] && [ "$TARGET_BYTES" -gt "$OTA_SIZE" ]; then
 	read -r ptyp pstart pcount <<EOF
 $(read_mbr_entry 0)
@@ -286,7 +318,7 @@ EOF
 				awk '{ print $1 + $2 * 256 + $3 * 65536 + $4 * 16777216 }')
 			[ "$got" = "$new_count" ] ||
 				give_up "cannot extend the root partition (wrote $got, wanted $new_count)"
-			log "root partition extended to $(($((pstart + new_count)) * 512 / 1048576)) MiB; the OS grows the filesystem on first boot"
+			log "root partition extended to $(($((pstart + new_count)) * 512 / 1048576)) MiB; the OS arms one grow boot to grow the filesystem"
 		else
 			log "the root partition already spans the card"
 		fi

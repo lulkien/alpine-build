@@ -255,9 +255,12 @@ echo "--- board runtime files"
 #
 # ota-flash (OS side) does not write the disk: it arms the next boot into flash
 # mode and reboots. Flash mode is what writes, from RAM, with no rootfs mounted.
-# growfs fills the card on the first boot after a flash; flash mode extends the
-# root partition before it reboots, and the service grows the filesystem into it
-# once, then reports there is nothing to do.
+# Filling the card is two boots, one per mode of the same RAM initramfs: flash
+# mode extends the root partition to the end of the card before it reboots, and
+# the growfs service then arms one grow boot, which grows the filesystem with
+# nothing mounted from it. Neither half can be done from the running OS - the
+# partition table cannot be re-read while the rootfs on it is mounted, and the
+# online resize2fs wedges this board - which is why both are boots.
 for tree in "${BOARD_RUNTIME_ROOTS[@]}"; do
   echo "    $tree"
   # -rlptDHX, not -a: the file's mode in the tree is the mode on the board (git
@@ -300,44 +303,93 @@ for tree in "${BOARD_RUNTIME_ROOTS[@]}"; do
     done
   done
 done
+# resize2fs is not for the OS to run: it is the payload grow mode runs inside the
+# RAM initramfs, which is packed out of this rootfs, so it has to be here.
 RESIZE=""; for c in "$ROOT/usr/sbin/resize2fs" "$ROOT/sbin/resize2fs"; do [ -x "$c" ] && RESIZE="$c"; done
 [ -n "$RESIZE" ] || { echo "FAIL: resize2fs missing from the rootfs (needs e2fsprogs-extra)"; exit 1; }
 
-echo "--- flash-mode initramfs"
-# Static busybox + the flash init + the bmap writer in a cpio archive. This is
-# what runs when the flash label boots: the target disk is not mounted, so the
-# write cannot collide with a live rootfs.
-IR="$WORK/flash-initramfs"
+echo "--- RAM initramfs (flash mode and grow mode)"
+# Static busybox + both modes' userspace in one cpio archive. It is what runs when
+# either the flash label or the grow label boots, and both act on the card with
+# nothing mounted from it: flash mode writes an image, grow mode resizes the root
+# filesystem (the online path wedges this board, see the growfs service).
+IR="$BUILDDIR/ram-initramfs"
 rm -rf "$IR"
-mkdir -p "$IR/bin" "$IR/dev" "$IR/tmp" "$IR/proc" "$IR/sys" "$IR/mnt/root"
+mkdir -p "$IR/bin" "$IR/dev" "$IR/tmp" "$IR/proc" "$IR/sys" "$IR/mnt/root" \
+         "$IR/lib" "$IR/sbin" "$IR/usr/sbin" "$IR/usr/lib"
 [ -x "$ROOT/bin/busybox.static" ] || { echo "FAIL: busybox-static missing from the rootfs"; exit 1; }
 install -m 755 "$ROOT/bin/busybox.static" "$IR/bin/busybox"
 ln -sf busybox "$IR/bin/sh"
-# The flash-mode /init and its bmap writer come from the runtime trees
-# (board/common/runtime/initramfs/: init -> /init, bin/bmap-write -> /bin/bmap-write),
-# the same mirror-the-destination convention as the rootfs tree.
+# /init, the bmap writer and the grow mode come from the runtime trees
+# (board/common/runtime/initramfs/: init -> /init, bin/* -> /bin/*), the same
+# mirror-the-destination convention as the rootfs tree.
 for tree in "${BOARD_RUNTIME_INITRAMFS_DIRS[@]}"; do
   rsync -rlptDHX --numeric-ids --no-owner --no-group "$WORK/$tree/" "$IR/"
+done
+# Grow mode's e2fsprogs are the image's own binaries, dynamically linked, so the
+# loader and their libraries come with them. Two traps that each cost a boot:
+#   - the soname files are symlinks (libe2p.so.2 -> libe2p.so.2.x), so copy with
+#     `cat` rather than `cp -a`: a copied symlink is dangling in the archive and
+#     the loader reports "Error loading shared library libe2p.so.2";
+#   - the dependency pass also copies /lib/ld-musl-aarch64.so.1 (every dynamic
+#     binary lists the loader) and it must not end up non-executable: execve()
+#     runs the loader, and mode 644 there fails every binary in the archive with
+#     EACCES, which at boot reads as "Failed to execute /init (error -13)".
+# Hence the explicit modes, re-applied after the copy.
+E2_BINS="/sbin/e2fsck /usr/sbin/resize2fs /usr/sbin/tune2fs"
+e2_copy() { # $1 = path inside the rootfs, $2 = mode for the copy
+  [ -e "$ROOT$1" ] || return 1
+  mkdir -p "$IR$(dirname "$1")"
+  cat "$ROOT$1" > "$IR$1" || return 1
+  chmod "$2" "$IR$1"
+}
+for bin in $E2_BINS; do
+  e2_copy "$bin" 755 ||
+    { echo "FAIL: $bin missing from the rootfs (grow mode runs it from the initramfs)" >&2; exit 1; }
+done
+e2_ldd="$BUILDDIR/e2fs-libs"
+# The loader's own --list instead of the ldd script: ldd is a shell script that an
+# image may not have installed, and the loader covers one binary per call.
+# shellcheck disable=SC2086
+for bin in $E2_BINS; do
+  chroot "$ROOT" /lib/ld-musl-aarch64.so.1 --list "$bin" 2>/dev/null || true
+done | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^\//) print $i }' | sort -u > "$e2_ldd"
+[ -s "$e2_ldd" ] || { echo "FAIL: no dependencies listed for the grow mode binaries"; exit 1; }
+while IFS= read -r lib; do
+  e2_copy "$lib" 644 ||
+    { echo "FAIL: $lib is needed by grow mode's e2fsprogs but is not in the rootfs" >&2; exit 1; }
+done < "$e2_ldd"
+for bin in /lib/ld-musl-aarch64.so.1 $E2_BINS; do
+  [ -f "$IR$bin" ] && chmod 755 "$IR$bin"
 done
 [ -f "$ROOT/usr/share/udhcpc/default.script" ] || { echo "FAIL: no udhcpc script in the rootfs"; exit 1; }
 install -m 755 "$ROOT/usr/share/udhcpc/default.script" "$IR/udhcpc.script"
 # init's stdio is /dev/console: it has to exist before the kernel execs /init
 mknod -m 600 "$IR/dev/console" c 5 1
 mknod -m 666 "$IR/dev/null" c 1 3
-( cd "$IR" && find . | cpio -o -H newc --quiet | gzip -9 ) > "$ROOT/boot/flash-initramfs.gz" \
-  || { echo "FAIL: cannot build flash-initramfs.gz"; exit 1; }
-ls -lh "$ROOT/boot/flash-initramfs.gz"
-# cpio -t prints names without the leading ".".
-# Listed once into a variable: `gzip | cpio | grep -q` would end the pipeline at
-# the first match and kill the writers with SIGPIPE, which pipefail then reports
-# as the check itself failing. The listing is wrapped in newlines so an entry can
-# be matched in any position, not just first or last.
-ir_listing=$'\n'$(gzip -dc "$ROOT/boot/flash-initramfs.gz" | cpio -t 2>/dev/null)$'\n'
-for entry in init bin/busybox bin/bmap-write udhcpc.script; do
+( cd "$IR" && find . | cpio -o -H newc --quiet | gzip -9 ) > "$ROOT/boot/ram-initramfs.gz" \
+  || { echo "FAIL: cannot build ram-initramfs.gz"; exit 1; }
+ls -lh "$ROOT/boot/ram-initramfs.gz"
+# cpio -t prints names without the leading ".". Listed once into a variable:
+# `gzip | cpio | grep -q` would end the pipeline at the first match and kill the
+# writers with SIGPIPE, which pipefail then reports as the check itself failing.
+# The listing is wrapped in newlines so an entry can be matched in any position,
+# not just first or last.
+ir_listing=$'\n'$(gzip -dc "$ROOT/boot/ram-initramfs.gz" | cpio -t 2>/dev/null)$'\n'
+for entry in init bin/busybox bin/bmap-write bin/grow-rootfs udhcpc.script \
+             sbin/e2fsck usr/sbin/resize2fs usr/sbin/tune2fs lib/ld-musl-aarch64.so.1; do
   case "$ir_listing" in
     *$'\n'"$entry"$'\n'*) ;;
-    *) echo "FAIL: $entry missing from flash-initramfs.gz" >&2; exit 1 ;;
+    *) echo "FAIL: $entry missing from ram-initramfs.gz" >&2; exit 1 ;;
   esac
+done
+# What has to exec inside the archive needs the executable bit in the archive, and
+# the loader most of all: execve() runs it for every binary above.
+ir_modes=$(gzip -dc "$ROOT/boot/ram-initramfs.gz" | cpio -tv 2>/dev/null)
+mode_ok() { printf '%s\n' "$ir_modes" | awk -v n="$1" '$1 == "-rwxr-xr-x" && $NF == n { found = 1 } END { exit !found }'; }
+for entry in init bin/busybox bin/grow-rootfs sbin/e2fsck usr/sbin/resize2fs lib/ld-musl-aarch64.so.1; do
+  mode_ok "$entry" ||
+    { echo "FAIL: $entry is not executable in ram-initramfs.gz (a non-executable loader breaks every binary)" >&2; exit 1; }
 done
 
 echo "--- services from the profile"
@@ -425,18 +477,33 @@ LABEL mainline
 EOF
 fi
 
-# Flash mode: RAM-only initramfs that downloads an image and writes it to the
-# disk. ota-flash rewrites this APPEND with ota_* parameters before setting
-# DEFAULT to flash, and restores extlinux.conf.bak if the flash aborts before
-# the first byte is written.
+# The RAM initramfs has two modes and one archive. Flash mode downloads an image
+# and writes it to the disk: ota-flash rewrites this APPEND with ota_* parameters
+# before setting DEFAULT to flash, and restores extlinux.conf.bak if the flash
+# aborts before the first byte is written.
 cat >> "$ROOT/boot/extlinux/extlinux.conf" <<EOF
 
 LABEL flash
   MENU LABEL Flash mode (downloads and writes an image, no OS running)
   LINUX /boot/vmlinuz-$KREL
   FDT /boot/dtbs/allwinner/$BOARD_BOOT_DTB
-  INITRD /boot/flash-initramfs.gz
-  APPEND rdinit=/init console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7 video=HDMI-A-1:1920x1080@60e panic=30
+  INITRD /boot/ram-initramfs.gz
+  APPEND rdinit=/init ram_mode=flash console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7 video=HDMI-A-1:1920x1080@60e panic=30
+EOF
+
+# Grow mode: the same RAM initramfs, cold-resizing the root filesystem. The growfs
+# service points DEFAULT here (after saving extlinux.conf.bak) when the filesystem
+# is smaller than its partition; grow mode restores that file before it reboots,
+# so this is a one-boot detour. Picking the label by hand at the menu is safe:
+# resize2fs on a filesystem that already fills its partition does nothing.
+cat >> "$ROOT/boot/extlinux/extlinux.conf" <<EOF
+
+LABEL grow
+  MENU LABEL Cold resize the root filesystem (no OS running)
+  LINUX /boot/vmlinuz-$KREL
+  FDT /boot/dtbs/allwinner/$BOARD_BOOT_DTB
+  INITRD /boot/ram-initramfs.gz
+  APPEND rdinit=/init ram_mode=grow console=ttyS0,115200 console=tty0 loglevel=7 panic=30
 EOF
 
 echo "--- resulting /boot"

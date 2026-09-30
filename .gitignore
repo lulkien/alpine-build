@@ -9,10 +9,9 @@ apk-tools-static/
 sbin/
 v322_h618.html
 
-# Build outputs
+# Build outputs (the RAM initramfs staging tree lives in build/)
 rootfs/
 image/
-flash-initramfs/
 *.img
 *.img.sha256
 
