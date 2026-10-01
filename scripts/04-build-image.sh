@@ -59,6 +59,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The image only has to hold the rootfs until the filesystem is grown to the card
+# on the first boot, so its size is a real cost rather than a free round number:
+# every block the image leaves unmapped has to be read and hashed to prove it holds
+# zeros before a sparse flash may write, and a full flash writes all of it. Content
+# plus headroom, asserted here with both numbers, so a fatter profile fails the
+# build with a reason instead of failing mid-rsync with ENOSPC.
+ROOT_MB=$(du -sm "$ROOT" | awk '{ print $1 }')
+HEADROOM_MB="${HEADROOM_MB:-256}"
+if [ "$((ROOT_MB + HEADROOM_MB))" -gt "$SIZE_MB" ]; then
+  echo "FAIL: the rootfs is ${ROOT_MB} MiB and image_size_mb is ${SIZE_MB} MiB: that leaves less" >&2
+  echo "      than the ${HEADROOM_MB} MiB headroom this needs (filesystem metadata, the journal," >&2
+  echo "      and a first boot's writes). Raise image_size_mb in board/common/board.toml, or trim" >&2
+  echo "      the profile." >&2
+  exit 1
+fi
+echo "--- image: ${SIZE_MB} MiB for a ${ROOT_MB} MiB rootfs (${HEADROOM_MB} MiB headroom)"
+
 mkdir -p "$IMGDIR" /mnt/target
 rm -f "$IMG"
 truncate -s "${SIZE_MB}M" "$IMG"
@@ -225,6 +242,17 @@ grow_initrd=$(awk '$1 == "LABEL" { inl = ($2 == "grow") } inl && $1 == "INITRD" 
 [ -f "/mnt/target$flash_initrd" ] || { echo "FAIL: $flash_initrd (both labels) is not on the image"; exit 1; }
 grep -q 'ram_mode=flash' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: the flash label does not ask for flash mode"; exit 1; }
 grep -q 'ram_mode=grow' "$WORK/rootfs/boot/extlinux/extlinux.conf" || { echo "FAIL: the grow label does not ask for grow mode"; exit 1; }
+# Both RAM labels must keep the kernel from disabling unused clocks and power
+# domains: the eMMC controller's are among them, and with them off every write to
+# the device stalls the CPU for seconds.
+for _label in flash grow; do
+  awk -v l="$_label" '$1 == "LABEL" { inl = ($2 == l); next } inl && $1 == "APPEND" { print; exit }' \
+    "$WORK/rootfs/boot/extlinux/extlinux.conf" | grep -q 'clk_ignore_unused' || {
+    echo "FAIL: the $_label label does not carry clk_ignore_unused (the RAM boot would stall on eMMC writes)"; exit 1; }
+  awk -v l="$_label" '$1 == "LABEL" { inl = ($2 == l); next } inl && $1 == "APPEND" { print; exit }' \
+    "$WORK/rootfs/boot/extlinux/extlinux.conf" | grep -q 'pm_genpd_ignore_unused' || {
+    echo "FAIL: the $_label label does not carry pm_genpd_ignore_unused"; exit 1; }
+done
 ir_listing=$'\n'$(gzip -dc "$WORK/rootfs$flash_initrd" | cpio -t 2>/dev/null)$'\n'
 for entry in init bin/grow-rootfs sbin/e2fsck usr/sbin/resize2fs; do
   case "$ir_listing" in

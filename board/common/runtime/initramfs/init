@@ -46,8 +46,14 @@ export PATH
 BUSYBOX=/bin/busybox
 TMP=/tmp
 
-log() { echo "flash> $*"; }
-warn() { echo "flash> $*" >&2; }
+# The console is not something anyone can read tomorrow, and flash mode has no
+# network at all, so every line also goes to a log in RAM, stamped with the
+# attempt's own clock (this machine has no RTC and never will in RAM: uptime is
+# the only honest ordering). save_log() lands that log on the boot partition at
+# each exit - see the end of this file.
+LOG=$TMP/flash.log
+log() { m="flash> t+$(awk '{ printf "%d", $1 }' /proc/uptime)s $*"; echo "$m"; echo "$m" >> "$LOG"; }
+warn() { m="flash> t+$(awk '{ printf "%d", $1 }' /proc/uptime)s $*"; echo "$m" >&2; echo "$m" >> "$LOG"; }
 
 # Every helper is a busybox applet from the initramfs; --install links them all.
 [ -x "$BUSYBOX" ] || { echo "flash> no busybox in the initramfs" >&2; exec sh; }
@@ -85,6 +91,7 @@ restore_and_reboot() { # $1 = reason
 	if [ -n "$OTA_ROOTPART" ] && [ -b "$OTA_ROOTPART" ]; then
 		log "restoring the boot configuration and going back to the installed OS"
 		if mkdir -p /mnt/root && mount -t ext4 "$OTA_ROOTPART" /mnt/root 2>/dev/null; then
+			save_log /mnt/root
 			if [ -f /mnt/root/boot/extlinux/extlinux.conf.bak ]; then
 				cp /mnt/root/boot/extlinux/extlinux.conf.bak \
 					/mnt/root/boot/extlinux/extlinux.conf &&
@@ -104,21 +111,83 @@ restore_and_reboot() { # $1 = reason
 	while true; do sleep 3600; done
 }
 
-read_mbr_entry() { # $1 = slot 0..3 -> "type start_sector sector_count"
-	dd if="$OTA_TARGET" bs=1 skip=$((446 + 16 * $1)) count=16 2>/dev/null |
-		od -An -v -tu1 |
-		awk '{ printf "%d %d %d\n", $5, $9 + $10 * 256 + $11 * 65536 + $12 * 16777216, \
-			$13 + $14 * 256 + $15 * 65536 + $16 * 16777216 }'
+# The partition-table helpers are shared with grow mode: both modes hand the rest
+# of the disk to the root partition, and two copies of that byte dance would drift.
+# mbr.sh is in the archive (bin/mbr.sh) and needs the applets linked above.
+. /bin/mbr.sh
+
+# ------------------------------------------------------------------- the record
+# Flash mode runs in RAM with no network, so when something goes wrong the only
+# thing that ever knew why was the HDMI console - and a machine that has come back
+# up is the worst place to debug that from. Every exit writes the log to the boot
+# partition instead, where the installed OS finds it as
+# /var/log/flash-attempt.log.
+save_log() { # $1 = an already-mounted boot partition, if there is one
+	[ -n "${OTA_ROOTPART:-}" ] && [ -b "$OTA_ROOTPART" ] || return 0
+	mp=$1
+	if [ -z "$mp" ]; then
+		mkdir -p /mnt/log
+		mount -t ext4 "$OTA_ROOTPART" /mnt/log 2>/dev/null || return 0
+		mp=/mnt/log
+	fi
+	mkdir -p "$mp/var/log" 2>/dev/null
+	{ echo "--- flash attempt: target $OTA_TARGET, mode ${OTA_MODE:-bmap}"; cat "$LOG" 2>/dev/null; } \
+		>> "$mp/var/log/flash-attempt.log" 2>/dev/null
+	sync
+	[ "$mp" = /mnt/log ] && umount /mnt/log 2>/dev/null
+	return 0
 }
 
-write_le32() { # $1 = value, $2 = byte offset on the target
-	printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
-		$(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )))" |
-		dd of="$OTA_TARGET" bs=1 seek="$2" conv=notrunc 2>/dev/null
+# Writing a disk that something has mounted is how a filesystem ends up with two
+# writers: the kernel's cached copy can land on top of freshly written blocks.
+# Nothing in flash mode should hold the target, so make a bug say so out loud.
+assert_target_not_mounted() {
+	if grep -qs "/dev/$(basename "$OTA_TARGET")" /proc/mounts; then
+		restore_and_reboot "something on $OTA_TARGET is mounted: refusing to write underneath it"
+	fi
+	return 0
+}
+
+# ------------------------------------------- a target that is not the boot medium
+# The usual flash targets the disk it was armed from, so the boot configuration is
+# part of what gets replaced and there is nothing to restore afterwards. When the
+# target is a *different* disk - flashing the eMMC from an SD, say - that
+# configuration survives and is still armed: the machine would come back into flash
+# mode after a successful flash, and after a reset in the middle of the slow part,
+# with nothing left to clear it. So put the installed system back as the default
+# before the slow part; the flash parameters stay in the label, and re-arming is a
+# DEFAULT away.
+disarm_boot_medium() { # $1 = force: disarm even when the target is the boot disk
+	[ -n "${OTA_ROOTPART:-}" ] && [ -b "$OTA_ROOTPART" ] || return 0
+	root_disk=$(mbr_whole_disk_of "$(basename "$OTA_ROOTPART")")
+	if [ "${1:-}" != force ] && [ "$root_disk" = "$(basename "$OTA_TARGET")" ]; then
+		return 0
+	fi
+	if [ "$root_disk" = "$(basename "$OTA_TARGET")" ]; then
+		log "the target is the disk holding $OTA_ROOTPART: disarming before the write, since the image replaces this configuration anyway"
+	else
+		log "the target $(basename "$OTA_TARGET") is not the disk holding $OTA_ROOTPART ($root_disk)"
+		log "putting the installed system back as the boot default for this boot"
+	fi
+	mkdir -p /mnt/root
+	if ! mount -t ext4 "$OTA_ROOTPART" /mnt/root 2>/dev/null; then
+		warn "cannot mount $OTA_ROOTPART to disarm: a reset would re-enter flash mode"
+		return 0
+	fi
+	if [ -f /mnt/root/boot/extlinux/extlinux.conf.bak ]; then
+		cp /mnt/root/boot/extlinux/extlinux.conf.bak /mnt/root/boot/extlinux/extlinux.conf &&
+			log "DEFAULT is the installed system again"
+	else
+		warn "no extlinux.conf.bak on $OTA_ROOTPART: nothing to restore"
+	fi
+	sync
+	umount /mnt/root
+	return 0
 }
 
 give_up() { # $1 = reason; the disk has been touched, nothing can recover it here
 	warn "$1"
+	save_log
 	echo
 	echo "flash> ==================================================================="
 	echo "flash> THE DISK HAS BEEN PARTLY WRITTEN."
@@ -146,6 +215,33 @@ fi
 
 # ------------------------------------------------------------- sanity checks
 [ -n "$OTA_URL" ] || restore_and_reboot "no ota_url on the kernel command line"
+# A device node does not exist the moment devtmpfs is mounted: the mmc controllers
+# are probed asynchronously and the eMMC - an 8-bit bus that runs tuning first -
+# lands noticeably after the SD does. Waiting is what makes "the target is not a
+# block device" mean that, instead of "not yet": checked three seconds after this
+# init started, it refused before any network was attempted, restored the config
+# and rebooted with nothing anywhere to say why. Log the inventory as it is found
+# either way, so the next failure of this shape explains itself.
+log "block devices at entry: $(ls /dev/mmcblk* /dev/vd* /dev/sd* 2>/dev/null | tr '\n' ' ')"
+wait_for_device() { # $1 = device, $2 = seconds to wait
+	t=0
+	while [ "$t" -lt "${2:-20}" ]; do
+		[ -b "$1" ] && break
+		t=$((t + 1))
+		sleep 1
+	done
+	if [ -b "$1" ]; then
+		log "$1 appeared after ${t}s"
+		return 0
+	fi
+	log "$1 did not appear in ${2:-20}s"
+	return 1
+}
+# The root partition is only needed to restore the boot configuration on the way
+# out, so it is not fatal for it to be late - or missing entirely.
+wait_for_device "$OTA_ROOTPART" 20 || true
+wait_for_device "$OTA_TARGET" 20 || true
+
 [ -n "$OTA_TARGET" ] || restore_and_reboot "no ota_target on the kernel command line"
 [ -b "$OTA_TARGET" ] || restore_and_reboot "$OTA_TARGET is not a block device"
 [ -n "$OTA_SHA" ] || restore_and_reboot "no ota_sha256: refusing to write unverified"
@@ -179,19 +275,37 @@ if [ -n "$OTA_HOSTNAME" ]; then
 	hostname "$OTA_HOSTNAME" 2>/dev/null
 fi
 ip link set eth0 up 2>/dev/null || restore_and_reboot "no eth0 in flash mode"
+
+# A cold PHY takes a moment to train and every attempt made before the link is up
+# is wasted. Wait for carrier, but not forever: a cable that is not there belongs in
+# the installed system, not in a machine sitting in RAM.
+carrier=0
+while [ "$carrier" -lt 20 ]; do
+	[ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = 1 ] && break
+	carrier=$((carrier + 1))
+	sleep 1
+done
+log "eth0 carrier after ${carrier}s: $(cat /sys/class/net/eth0/carrier 2>/dev/null || echo unknown), speed $(cat /sys/class/net/eth0/speed 2>/dev/null || echo unknown)"
+
+# This network assigns by DHCP and only by DHCP: a static address is neither routed
+# nor accepted here, which is true of anything with DHCP snooping or port security.
+# So there is no handed-over address to try and no point accepting one on the
+# command line - what a RAM init must do instead is leave a record of how far it
+# got, because a failure at this point is otherwise invisible from anywhere.
 got_ip=0
-for attempt in 1 2 3; do
+for attempt in 1 2 3 4; do
 	log "dhcp attempt $attempt"
 	if udhcpc -i eth0 -n -q -t 8 -T 3 -s /udhcpc.script >/dev/null 2>&1; then
 		got_ip=1
 		break
 	fi
-	sleep 2
+	sleep 3
 done
 [ "$got_ip" = 1 ] || restore_and_reboot "no DHCP lease on eth0"
 IP=$(ip -4 -o addr show dev eth0 | awk '{ print $4 }' | head -1)
 [ -n "$IP" ] || restore_and_reboot "eth0 has no IPv4 address after DHCP"
 log "eth0 is up: $IP"
+log "default route: $(ip route show default 2>/dev/null | head -1)"
 
 wget_or() { # $1 = url, $2 = output file ("-" for stdout)
 	wget -q -T 30 -O "$2" "$1" 2>/dev/null
@@ -220,8 +334,20 @@ if [ "$OTA_MODE" = bmap ]; then
 		restore_and_reboot "bmap describes $BMAP_SIZE bytes, image is $OTA_SIZE"
 	BMAP_RANGES=$(grep -c '<Range' "$TMP/image.bmap")
 	[ "$BMAP_RANGES" -gt 0 ] || restore_and_reboot "bmap has no ranges"
-	log "bmap ok: $BMAP_RANGES ranges"
+	# The ranges are `<Range chksum="..."> start length </Range>`, so field 4 is the
+	# byte count: summing them is what the write will actually move, and the progress
+	# percentage has to be measured against that and not the whole image.
+	BMAP_MAPPED=$(awk '/<Range/ { s += $4 } END { print s + 0 }' "$TMP/image.bmap")
+	[ "$BMAP_MAPPED" -gt 0 ] || BMAP_MAPPED=$OTA_SIZE
+	log "bmap ok: $BMAP_RANGES ranges, $((BMAP_MAPPED / 1048576)) MiB of the image is mapped"
 fi
+
+# The disk this boot configuration lives on is not always the disk being written -
+# an eMMC flash armed from the SD, for instance. Put that configuration back on the
+# installed system before anything slow: the target's own config is replaced by the
+# image, but a config on a disk that is *not* written survives the flash and would
+# send the machine straight back into flash mode.
+disarm_boot_medium
 
 echo
 echo "flash> ==================================================================="
@@ -230,6 +356,16 @@ echo "flash> a failure or a power cut needs a card reader and a fresh flash."
 echo "flash> ==================================================================="
 echo
 sleep 10
+
+# The boot configuration is put back *here*, before the write, and not only on the
+# way out: a panic or a power cut skips every handler below, and a configuration
+# still pointing at flash mode then sends the machine straight back into the same
+# write, forever. Every refusal has already happened by this point, so writing the
+# boot partition now cannot turn a refusal into a write - and it rewrites a block the
+# image already fills, so the target still ends up byte for byte the image. The log
+# deliberately stays out of this: a fresh log block would land in a gap no sparse
+# write touches, and then the target *would* differ from the image.
+disarm_boot_medium force
 
 # A sparse write never touches the blocks between ranges and the image is zero
 # there, so those blocks must already be zero on the target. Failing this check
@@ -241,18 +377,64 @@ if [ "$OTA_MODE" = bmap ]; then
 		restore_and_reboot "the target is not zero where the image is: re-arm with --full to write every byte"
 fi
 
+assert_target_not_mounted
+
+# ash has no PIPESTATUS: the status of `wget | gzip | bmap-write` is the writer's
+# alone. So a download that died halfway reports as a write failure, and one that
+# never started reports as a failure *after* the first byte - the one classification
+# this machine cannot recover from. Each stage records its own status in a file and
+# all three are read afterwards.
+fetch() { # $1 = the writer's arguments
+	rm -f "$TMP/wget.rc" "$TMP/gzip.rc"
+	( wget -q -T "$OTA_TIMEOUT" -O - "$OTA_URL" 2>"$TMP/wget.err"; echo $? > "$TMP/wget.rc" ) |
+		( gzip -dc 2>"$TMP/gzip.err"; echo $? > "$TMP/gzip.rc" ) |
+		bmap-write $1 -t "$OTA_TARGET"
+}
+
+# Progress for the write itself, the same way the read-back below reports: watch the
+# device's own write counter (field 7 of /sys/class/block/<dev>/stat, 512-byte
+# sectors) rather than asking the writer, which has no idea how long the stream will
+# be. A write that prints nothing for minutes is indistinguishable from a write that
+# died, and the console is the only output this machine has.
+write_total=$OTA_SIZE
+[ "$OTA_MODE" = bmap ] && write_total=$BMAP_MAPPED
+dev_stat="/sys/class/block/$(basename "$OTA_TARGET")/stat"
+write_before=$(awk '{ print $7 }' "$dev_stat" 2>/dev/null)
+(
+	while :; do
+		sleep 5
+		[ -n "$write_before" ] || continue
+		now=$(awk '{ print $7 }' "$dev_stat" 2>/dev/null)
+		[ -n "$now" ] || continue
+		written_bytes=$(( (now - write_before) * 512 ))
+		[ "$written_bytes" -lt 0 ] && written_bytes=0
+		pct=$((written_bytes * 100 / write_total))
+		[ "$pct" -gt 99 ] && pct=99
+		echo "[write]   $pct%  $((written_bytes / 1048576))/$((write_total / 1048576)) MiB written"
+	done
+) &
+write_prog=$!
+
 start=$(date +%s)
 if [ "$OTA_MODE" = full ]; then
 	log "streaming the whole image (mode=full, read timeout ${OTA_TIMEOUT}s)"
-	wget -q -T "$OTA_TIMEOUT" -O - "$OTA_URL" | gzip -dc |
-		bmap-write --full -t "$OTA_TARGET" || give_up "write failed"
+	fetch --full
+	write_rc=$?
 else
 	log "streaming the image, writing mapped blocks only (mode=bmap, read timeout ${OTA_TIMEOUT}s)"
-	wget -q -T "$OTA_TIMEOUT" -O - "$OTA_URL" | gzip -dc |
-		bmap-write -b "$TMP/image.bmap" -t "$OTA_TARGET" || give_up "write failed"
+	fetch "-b $TMP/image.bmap"
+	write_rc=$?
 fi
+kill "$write_prog" 2>/dev/null
+wait "$write_prog" 2>/dev/null
+echo "[write]   100%  $((write_total / 1048576))/$((write_total / 1048576)) MiB written"
 elapsed=$(( $(date +%s) - start ))
-log "write finished in ${elapsed}s"
+log "write finished in ${elapsed}s: writer $write_rc, wget $(cat "$TMP/wget.rc" 2>/dev/null || echo '?'), gzip $(cat "$TMP/gzip.rc" 2>/dev/null || echo '?')"
+if [ "$write_rc" != 0 ]; then
+	[ "$(cat "$TMP/wget.rc" 2>/dev/null || echo 1)" = 0 ] ||
+		warn "the download failed: $(tail -1 "$TMP/wget.err" 2>/dev/null)"
+	give_up "write failed"
+fi
 
 # ------------------------------------------------------------------ verification
 magic=$(dd if="$OTA_TARGET" bs=1 skip=8192 count=8 2>/dev/null | od -A n -t x1 |
@@ -305,19 +487,27 @@ fi
 # filesystem into it (the growfs service, then the grow label - the other mode of
 # this same initramfs). Doing it from the running OS is not possible, the table
 # cannot be re-read while the rootfs on it is mounted.
+#
+# A partition after the root one is never eaten: the extension stops at its start.
+# That costs nothing today and is what keeps a recovery or persist partition
+# possible later.
 if [ "${OTA_FILL:-1}" = 1 ] && [ "$TARGET_BYTES" -gt "$OTA_SIZE" ]; then
 	read -r ptyp pstart pcount <<EOF
-$(read_mbr_entry 0)
+$(mbr_entry "$OTA_TARGET" 0)
 EOF
 	if [ "${ptyp:-0}" = 131 ] && [ "${pstart:-0}" -ge 2048 ]; then
-		new_count=$(( TARGET_BYTES / 512 - pstart ))
+		disk_end=$(( TARGET_BYTES / 512 ))
+		next_start=$(mbr_next_start "$OTA_TARGET" "${pstart:-0}")
+		[ -n "$next_start" ] && end=$next_start || end=$disk_end
+		new_count=$(( end - pstart ))
 		if [ "$new_count" -gt "${pcount:-0}" ]; then
-			write_le32 "$new_count" 458
+			mbr_write_count "$OTA_TARGET" 0 "$new_count"
 			sync
-			got=$(dd if="$OTA_TARGET" bs=1 skip=458 count=4 2>/dev/null | od -An -v -tu1 |
-				awk '{ print $1 + $2 * 256 + $3 * 65536 + $4 * 16777216 }')
-			[ "$got" = "$new_count" ] ||
-				give_up "cannot extend the root partition (wrote $got, wanted $new_count)"
+			read -r _ _ got <<EOF
+$(mbr_entry "$OTA_TARGET" 0)
+EOF
+			[ "${got:-0}" = "$new_count" ] ||
+				give_up "cannot extend the root partition (wrote ${got:-nothing}, wanted $new_count)"
 			log "root partition extended to $(($((pstart + new_count)) * 512 / 1048576)) MiB; the OS arms one grow boot to grow the filesystem"
 		else
 			log "the root partition already spans the card"
@@ -331,6 +521,9 @@ sync
 echo
 log "image written and verified"
 log "rebooting into it; the new image boots the OS (its extlinux default is bsp)"
+# Saved last: for the usual flash this partition is the one just written, and
+# mounting it before the write would be a second writer on the target.
+save_log
 echo
 reboot -f
 while true; do sleep 3600; done

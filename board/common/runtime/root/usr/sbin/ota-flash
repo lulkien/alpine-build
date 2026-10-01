@@ -212,7 +212,11 @@ if [ "$MODE" = bmap ]; then
 fi
 
 PARAMS="rdinit=/init ram_mode=flash console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7"
-PARAMS="$PARAMS video=HDMI-A-1:1920x1080@60e panic=30"
+# clk_ignore_unused and pm_genpd_ignore_unused are not optional here: without them
+# the kernel disables the clock and power domain it thinks the eMMC controller is
+# not using, and every write to that device stalls the CPU for seconds (measured:
+# ~3 MB/s with RCU stalls, against 17 MB/s from the OS, which boots with the flags).
+PARAMS="$PARAMS clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e panic=30"
 # ram_mode stays on this line: the APPEND written here replaces the label's own,
 # and the RAM initramfs would otherwise have to guess which of its two modes this is.
 PARAMS="$PARAMS ota_url=$URL ota_sha256=$EXPECT_SHA ota_size=$EXPECT_SIZE"
@@ -220,6 +224,11 @@ PARAMS="$PARAMS ota_target=$TARGET ota_rootpart=$ROOTPART ota_mode=$MODE"
 PARAMS="$PARAMS ota_hostname=$(hostname)"
 [ "$HAVE_BMAP" = 1 ] && PARAMS="$PARAMS ota_bmap=$SIDE_BMAP"
 
+# No network parameters are handed over: this flasher DHCPs. A static address is
+# not an option on the LAN this was developed against (DHCP only - snooping/port
+# security), and a handed-over address that is quietly not routable is worse than
+# no address at all, because it fails at the metadata fetch and looks like a bad
+# image. If a deployment ever needs a static link, that path wants its own test.
 echo
 echo "Next boot runs flash mode instead of this system:"
 echo "  $PARAMS"

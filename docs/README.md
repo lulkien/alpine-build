@@ -153,19 +153,63 @@ writeback inside the image being written, and the flasher's own executables were
 read back from the blocks `dd` was overwriting.
 
 Flash mode sequence (`board/common/runtime/initramfs/init`, which dispatches between
-the two modes): read the `ota_*` parameters from the
-kernel command line, bring `eth0` up over DHCP, fetch the bmap, stream the `.gz`
-through gzip writing only the mapped ranges, verify every range by reading it
-back, check the u-boot magic at KiB 8, reboot. The freshly written image has
-`DEFAULT bsp`, so the box comes up in the OS.
+the two modes): read the `ota_*` parameters from the kernel command line, wait for
+the target device to appear, bring `eth0` up, fetch the bmap, stream the `.gz`
+through gzip writing only the mapped ranges, verify every range by reading it back,
+check the u-boot magic at KiB 8, reboot. The freshly written image has `DEFAULT bsp`,
+so the box comes up in the OS.
+
+Four details of that sequence carry the design:
+
+- **The device wait.** devtmpfs is mounted early, but the mmc controllers probe
+  asynchronously and the eMMC runs 8-bit tuning before registering, so its node
+  appears well after the SD's. Reading `[ -b $OTA_TARGET ]` too early says "the
+  target does not exist" and refuses for no reason — which is how the first two
+  attempts at an eMMC flash failed, three seconds in, before any network was tried.
+  The init waits up to 20 s (logging how long it took) and logs the block-device
+  inventory at entry either way.
+- **DHCP only.** The flasher waits (bounded) for carrier and then retries DHCP four
+  times. It takes no static address on the command line: this LAN assigns by DHCP
+  only — a static address is not routed here and snooping/port security refuses it —
+  so a handed-over address would fail at the metadata fetch and look like a bad
+  image.
+- **The two flags the RAM labels must carry.** `clk_ignore_unused` and
+  `pm_genpd_ignore_unused` are not decoration: without them the kernel disables the
+  clocks and power domains it believes nothing is using, and the eMMC controller's are
+  among them (console evidence: `clk: Disabling unused clocks`, `PM: genpd: Disabling
+  unused power domains`, and a `sync_state() pending` complaint from the power
+  controller). The `bsp` and `debug` labels always had them; the `flash` and `grow`
+  labels did not, and the build now fails if either loses them again.
+- **Sustained eMMC writes from the RAM init stall the CPU — and still finish.** These
+  writes block a CPU for seconds at a time, so the RCU stall detector prints its stack
+  dumps repeatedly and the console looks dead. It is not dead: `resize2fs` on the eMMC
+  completed (392960 → 3816704 blocks) after several minutes of exactly that, with small
+  writes (every log milestone) landing normally throughout and raw sequential writes from
+  the OS running at 17 MB/s with no stalls at all. **Do not power-cycle it while it is
+  grinding**: the run is not lost, the resize is simply slow, and a reset in the middle
+  costs the whole attempt.
+- **A target on another disk.** `ota-flash` derives its target from the disk holding
+  `/` and will not take another; a hand-armed label may (`ota_target=/dev/mmcblk1`,
+  flashing the eMMC from the SD). When the target is not the disk the boot
+  configuration lives on, the init puts that configuration back to the installed
+  system *before* the slow part — otherwise it survives the flash still armed and
+  the machine re-enters flash mode forever. A target that *is* the boot disk needs
+  none of that, and the refusal path already restores it.
+- **The record.** Every log line goes to a RAM log carrying the attempt's own uptime
+  (there is no RTC in RAM), and every exit — success, refusal, give-up — appends it
+  to `/var/log/flash-attempt.log` on the partition named by `ota_rootpart`. A failure
+  that only ever appeared on the HDMI console is readable afterwards from the
+  installed system; on success the file lands in the freshly written image's own
+  filesystem.
 
 Recovery, and the two outcomes are different:
 
-- A failure **before the first byte is written** — no DHCP lease, sidecar
-  missing, bmap inconsistent with the image, or a target that is not zero
-  outside the mapped ranges — restores `extlinux.conf.bak`, syncs and reboots:
-  the installed system starts as if nothing had happened. `ota-flash --cancel`
-  undoes the arming before that reboot as well.
+- A failure **before the first byte is written** — no DHCP lease, a target device
+  that never appears, sidecar missing, bmap inconsistent with the image, or a target
+  that is not zero outside the mapped ranges — restores `extlinux.conf.bak`, syncs
+  and reboots: the installed system starts as if nothing had happened. The flasher
+  also refuses to start writing while anything on the target is mounted.
+  `ota-flash --cancel` undoes the arming before that reboot as well.
 - A failure **after the write starts** leaves a partly written disk. Nothing on
   the machine can recover it: pull the card and flash it in a reader.
 
@@ -228,8 +272,8 @@ ours to `bmaptool` fails outright). Measured against this writer on the same
 target, bmaptool was not faster, and Alpine has no bmaptool package for the
 initramfs anyway, so the bmap stays ours.
 
-The map skips roughly 70% of the image, so flash mode writes about 1.2 GiB
-instead of 4 GiB. Unmapped blocks are never written and the image is zero there,
+The map skips roughly two thirds of the image, so flash mode writes about 1.1 GiB
+instead of all of it. Unmapped blocks are never written and the image is zero there,
 so the target must already hold zeros outside the mapped ranges. A card that
 already held a different image does not: its old bytes survive in those gaps and
 the result is a disk that is not the image it claims to be, verified ranges and
@@ -240,20 +284,29 @@ every byte.
 
 ### Filling the card
 
-The image is built at a fixed 4096 MiB. On a bigger card the filesystem is grown
-into the rest of it, and that takes two boots because each half of the job can
-only be done while nothing is mounted from the card:
+The image is built to hold the rootfs with headroom (`image_size_mb` in
+`board/common/board.toml`, 1536 MiB today, with stage 04 refusing a rootfs that
+does not fit with 256 MiB to spare). Its size is a cost rather than a round
+number, and it is the flasher that pays: blocks the image does not map have to be
+read and hashed to prove they are zero before a sparse write may start, and a
+full write writes them. On a bigger card, everything the disk has is handed over,
+by whichever mode can see the disk with nothing mounted from it:
 
-- **the partition**, extended by flash mode after the write has been verified —
-  one 4-byte write to the partition table — because the kernel only re-reads the
-  table when no filesystem from that disk is mounted;
-- **the filesystem**, grown by the `grow` boot mode, which is the other mode of
-  the same RAM initramfs: `e2fsck -f`, then `resize2fs` on the unmounted
-  partition.
+- **the partition.** Flash mode extends it right after the write has been verified
+  (one 4-byte write to the partition table), and grow mode does the same for a
+  medium that was installed as a plain image copy — where the filesystem already
+  fills its partition, so nothing running from that medium could extend it. Grow
+  mode can finish the job in one boot where flash mode hands it to the OS: it
+  writes the table *and* re-reads it (`blockdev --rereadpt`; nothing is mounted),
+  so the extension and the resize happen together.
+- **the filesystem**, grown by grow mode with `e2fsck -f` and then `resize2fs` on
+  the unmounted partition.
 
-The `growfs` service in the default runlevel decides and arms the second boot. It
-compares the filesystem size (`tune2fs -l`) with its partition's size
-(`/sys/class/block/*/size`), and when there is room it saves
+The `growfs` service in the default runlevel decides and arms that boot, for either
+reason: the filesystem smaller than its partition, or the partition smaller than
+the disk. It compares `tune2fs -l` with its partition's size
+(`/sys/class/block/*/size`) and the disk's own, stopping at the next partition's
+start so a later partition is never grown over, and when there is room it saves
 `/boot/extlinux/extlinux.conf.bak`, points `DEFAULT` at the `grow` label, counts
 the attempt and reboots. Grow mode restores that backup before it reboots, so the
 box comes back to the installed system either way, and `/var/log/grow.log` on the
@@ -280,11 +333,13 @@ a successful flash leaves the target byte-identical to the image, and that an
 abort before the first byte restores the boot configuration from the backup and
 leaves the rest of the target untouched.
 
-`tests/qemu-grow-mode.sh` covers the other mode without the board: it boots the
-RAM initramfs with `ram_mode=grow` against a disk whose root filesystem is smaller
-than its partition, and checks that the guest grew it to fill the partition,
-restored the boot configuration from `extlinux.conf.bak`, cleared the arming
-counter, and wrote `/var/log/grow.log`.
+`tests/qemu-grow-mode.sh` covers grow mode without the board, in the two shapes it
+has to handle: `fs`, where only the filesystem is small, and `dd`, where the
+partition is what has to grow first. Both boot the RAM initramfs with
+`ram_mode=grow` and check that the guest ended with the filesystem filling
+everything the disk allows, restored the boot configuration from
+`extlinux.conf.bak`, cleared the arming counter, and wrote `/var/log/grow.log`; the
+`dd` case also asserts the partition table the guest wrote and re-read.
 
 `tests/qemu-flash-small.sh` runs the same chain against a 16 MiB fixture in
 seconds, which is the one to run on every change. Its target is larger than the
@@ -294,6 +349,84 @@ target's partition entry back to confirm what the guest wrote. `POISON=1` fills
 the target with random bytes first, so the gap check has to refuse: the write
 never starts, the boot configuration is restored, and the installed system stays
 intact.
+
+## Growing the root filesystem (cold, from RAM)
+
+A medium installed as a plain image copy carries the image's own partition table: p1
+is image-sized and the filesystem already fills it, so nothing on a running system can
+grow it — the table cannot be re-read while the rootfs on it is mounted, and resizing
+that rootfs online wedges this board (unreachable within ~15 s, then a watchdog reset
+loop, the filesystem unchanged and needing journal replay). Both are avoided by doing
+the work with nothing mounted from the card, in the second mode of the RAM initramfs:
+
+    growfs service (default runlevel, on the installed OS)
+        compares the filesystem with its partition, and the partition with the disk;
+        when there is room it saves extlinux.conf, points DEFAULT at `grow`, counts
+        the attempt, and reboots
+    boot with the `grow` label (ram_mode=grow, no OS running)
+        finds the root filesystem by its ext4 label, gives the partition the rest of
+        the disk it can use, e2fsck -f, resize2fs, records what happened, restores
+        the boot configuration, clears the counter, reboots
+    the OS comes up with the grown filesystem
+
+Three properties are deliberate, each of them because of a failure seen on hardware:
+
+- **It logs as it goes, into the filesystem it is growing.** A panic skips every
+  handler the script has, and this mode runs on a console nobody can query from
+  anywhere: the first run of the grow mode on an eMMC died before its first log line
+  and left no record at all, which is why it could not be explained afterwards. Each
+  milestone is now appended to the target's `/var/log/grow.log` — mount, write, sync,
+  unmount, because e2fsck and resize2fs both need the filesystem unmounted and a
+  mount held across them would make this the second writer.
+- **It disarms the boot configuration before the slow part.** Same reason: a
+  configuration still pointing at `grow` reboots into the same panic forever, and the
+  machine can then never reach its OS. The service re-arms whenever there is still
+  room, so disarming early costs nothing and every failure lands back in the installed
+  system.
+- **It carries `clk_ignore_unused pm_genpd_ignore_unused`** like the flash label, so the
+  early boot cannot disable the eMMC controller's clock and power domain (see the flash
+  section). The resize still makes the console look dead for minutes even with them in
+  place: budget minutes, and do not interrupt it. It completes — the partition extension, the
+  `e2fsck` and the `resize2fs` all finished on this eMMC, 1.4 GiB → 14.3 GiB — so the
+  right move at that point is patience, not a power cycle.
+- **It waits for the disk to be there.** devtmpfs is mounted in the first seconds of
+  this mode's life, but the mmc controllers are still probing: at t+3s
+  `/sys/class/block` can hold no partition node at all, so looking once reports "no
+  ext4 filesystem labelled rootfs" on a disk that is sitting right there. It waits
+  (bounded, 20 s) for a partition node and prints the inventory when it gives up. The
+  same premature look refused a flash three seconds in, before any network, and was
+  fixed with a wait there first.
+- **A failing resize is bounded.** The counter keeps the service from arming more than
+  `MAX_ATTEMPTS` times, so a resize that cannot finish does not become a boot loop.
+
+To read the record after a medium that loops: boot the *other* medium, mount the quiet
+one, read `/var/log/grow.log`. `debugfs -R "cat /var/log/grow.log" /dev/<part>` works
+even when the filesystem is unclean, and replays no journal.
+
+Flash mode follows the same rule for the same reason: it disarms the boot
+configuration immediately before the write. Every refusal has already happened by
+then, so writing the boot partition cannot turn a refusal into a write — and it
+rewrites a block the image already fills, so the target still ends up byte for byte
+the image. Its log deliberately does *not* go out at that point: a fresh log block
+would land in a gap no sparse write touches, and then the target would differ from the
+image. It goes out at each exit instead.
+
+### Provisioning a spare medium from the OS
+
+Writing a *boot* medium has to happen in RAM, for the reasons above. A medium the
+running system is not using has no such problem, and the OS does it faster and more
+predictably: a full 1536 MiB image to the eMMC took about 90 s there (17 MB/s) against
+roughly 3 MB/s with RCU stalls from the RAM init's kernel on the same device,
+byte-for-byte verified afterwards:
+
+```
+wget -O - <release>.img.gz | gzip -dc | dd of=/dev/mmcblk1 bs=8M oflag=direct
+dd if=/dev/mmcblk1 bs=1M | head -c 1610612736 | sha256sum   # against <release>.img.sha256
+```
+
+Then give p1 the rest of the medium (the four-byte count at MBR offset 458) and grow
+the filesystem offline with `e2fsck -f` + `resize2fs`, rather than booting the spare
+and letting the grow mode try — which is the path that had no record when it failed.
 
 ## USB hotplug (and why a plugged-in keyboard did nothing)
 
@@ -563,12 +696,13 @@ right.
 - eMMC install: flash the same image to eMMC (`dd` from the running system or
   the vendor tool) — `root=PARTUUID=abcd1234-01` resolves identically there. Note
   what a plain image copy does *not* do: it carries the image's own partition
-  table, so a 14.6 GiB chip keeps a 4096 MiB partition and `growfs` reports there
-  is nothing to grow (`df` shows 3.9 G). Flash mode is the path that extends the
-  partition (`ota_fill=1`); for a dd'ed medium, extend it by hand — the same
-  4-byte MBR write — and reboot, and grow mode does the rest. Two media flashed
-  from one image also share `root=PARTUUID=abcd1234-01`, so blank the one you are
-  not booting: zero its first 16 MiB, MBR and u-boot and ext4 superblock alike.
+  table, so a 14.6 GiB chip starts with an image-sized partition (1535 MiB, `df`
+  showing 1.5 G). That resolves itself on the first boot: `growfs` sees the
+  partition smaller than the disk, arms one grow boot, and grow mode extends the
+  partition and the filesystem together — no hand-editing, no second boot. Two
+  media flashed from one image share `root=PARTUUID=abcd1234-01`, though, so blank
+  the one you are not booting: zero its first 16 MiB, MBR and u-boot and ext4
+  superblock alike.
 - The 100M link is the piece to watch on first boot: if it stays down, compare
   `ip link`/`ethtool` against the Armbian install and tune the RMII delays in
   the DTB (the vendor DTB may need `allwinner,rx/tx-delay-ps` or an

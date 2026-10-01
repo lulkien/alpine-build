@@ -364,6 +364,11 @@ for bin in /lib/ld-musl-aarch64.so.1 $E2_BINS; do
 done
 [ -f "$ROOT/usr/share/udhcpc/default.script" ] || { echo "FAIL: no udhcpc script in the rootfs"; exit 1; }
 install -m 755 "$ROOT/usr/share/udhcpc/default.script" "$IR/udhcpc.script"
+# mbr.sh is shared with the OS side: the growfs service decides whether the disk
+# has room, the modes here do the writing. One source, in the rootfs tree, copied
+# into the archive - the same arrangement as the udhcpc script above.
+[ -f "$ROOT/usr/lib/solovox/mbr.sh" ] || { echo "FAIL: usr/lib/solovox/mbr.sh missing from the rootfs"; exit 1; }
+install -m 755 "$ROOT/usr/lib/solovox/mbr.sh" "$IR/bin/mbr.sh"
 # init's stdio is /dev/console: it has to exist before the kernel execs /init
 mknod -m 600 "$IR/dev/console" c 5 1
 mknod -m 666 "$IR/dev/null" c 1 3
@@ -376,7 +381,7 @@ ls -lh "$ROOT/boot/ram-initramfs.gz"
 # The listing is wrapped in newlines so an entry can be matched in any position,
 # not just first or last.
 ir_listing=$'\n'$(gzip -dc "$ROOT/boot/ram-initramfs.gz" | cpio -t 2>/dev/null)$'\n'
-for entry in init bin/busybox bin/bmap-write bin/grow-rootfs udhcpc.script \
+for entry in init bin/busybox bin/bmap-write bin/grow-rootfs bin/mbr.sh udhcpc.script \
              sbin/e2fsck usr/sbin/resize2fs usr/sbin/tune2fs lib/ld-musl-aarch64.so.1; do
   case "$ir_listing" in
     *$'\n'"$entry"$'\n'*) ;;
@@ -488,7 +493,7 @@ LABEL flash
   LINUX /boot/vmlinuz-$KREL
   FDT /boot/dtbs/allwinner/$BOARD_BOOT_DTB
   INITRD /boot/ram-initramfs.gz
-  APPEND rdinit=/init ram_mode=flash console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7 video=HDMI-A-1:1920x1080@60e panic=30
+  APPEND rdinit=/init ram_mode=flash console=ttyS0,115200 console=tty0 net.ifnames=0 loglevel=7 clk_ignore_unused pm_genpd_ignore_unused video=HDMI-A-1:1920x1080@60e panic=30
 EOF
 
 # Grow mode: the same RAM initramfs, cold-resizing the root filesystem. The growfs
@@ -503,7 +508,7 @@ LABEL grow
   LINUX /boot/vmlinuz-$KREL
   FDT /boot/dtbs/allwinner/$BOARD_BOOT_DTB
   INITRD /boot/ram-initramfs.gz
-  APPEND rdinit=/init ram_mode=grow console=ttyS0,115200 console=tty0 loglevel=7 panic=30
+  APPEND rdinit=/init ram_mode=grow console=ttyS0,115200 console=tty0 loglevel=7 clk_ignore_unused pm_genpd_ignore_unused panic=30
 EOF
 
 echo "--- resulting /boot"

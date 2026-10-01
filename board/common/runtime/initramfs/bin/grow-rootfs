@@ -11,9 +11,11 @@
 # filesystem unmounted runs entirely in userspace, never enters that path, and
 # finished in about fifteen seconds for 4 GiB -> 14.6 GiB.
 #
-# Sequence: find the root filesystem -> e2fsck -f -> resize2fs -> mount, record
-# what happened in /var/log/grow.log, hand the boot back to the installed OS
-# (extlinux.conf.bak) -> reboot.
+# Sequence: find the root filesystem -> give it the rest of the disk when the
+# partition is what holds it back (a medium installed by dd comes that way, and the
+# table can be re-read here because nothing is mounted from the card) -> e2fsck -f
+# -> resize2fs -> mount, record what happened in /var/log/grow.log, hand the boot
+# back to the installed OS (extlinux.conf.bak) -> reboot.
 #
 # Booted by hand from the menu, with no parameters at all, this is still safe:
 # resize2fs on a filesystem that already fills its partition reports there is
@@ -30,6 +32,10 @@ LABEL=${GROW_LABEL:-rootfs}
 DEV=""
 SAMPLER=""
 
+# The partition-table helpers, shared with flash mode: both modes give the root
+# partition the rest of the disk, and two copies of that byte dance would drift.
+. /bin/mbr.sh
+
 say() {
 	echo "grow> $*"
 	echo "grow> $*" >> "$LOG"
@@ -38,6 +44,50 @@ say() {
 note() { # progress that must not pollute find_root_fs's stdout
 	echo "grow> $*" >&2
 	echo "grow> $*" >> "$LOG"
+}
+
+MNT=/mnt
+
+# The RAM log dies with the reset, and a panic is exactly the case that needs
+# explaining afterwards: this mode runs on a console nobody can query from anywhere,
+# driven by a machine that reboots itself. So every milestone also lands in
+# /var/log/grow.log *inside the target filesystem* - boot the other medium, mount
+# this one, read it. The mount comes and goes around each write: e2fsck and
+# resize2fs both need the filesystem unmounted, and a mount held across the resize
+# would make this the second writer on it.
+fslog() { # $1 = line to append to the target's /var/log/grow.log
+	[ -n "${DEV:-}" ] || return 0
+	mkdir -p "$MNT"
+	mount -t ext4 "$DEV" "$MNT" 2>/dev/null || return 0
+	mkdir -p "$MNT/var/log" 2>/dev/null
+	echo "grow> $*" >> "$MNT/var/log/grow.log" 2>/dev/null
+	sync
+	umount "$MNT" 2>/dev/null
+	return 0
+}
+
+milestone() { # say it here, and leave it on the filesystem for afterwards
+	say "$*"
+	fslog "$*"
+}
+
+# Take the arming out of the boot configuration *before* the work that can panic.
+# A panic skips every handler in this script, and a configuration still pointing at
+# `grow` then reboots into the same panic forever - which is precisely what happened
+# the first time this ran on an eMMC. The service on the OS re-arms whenever the
+# filesystem is still smaller than its partition, so disarming early costs nothing
+# and makes every failure land back in the installed system.
+restore_boot_config() {
+	[ -n "${DEV:-}" ] || return 0
+	mkdir -p "$MNT"
+	mount -t ext4 "$DEV" "$MNT" 2>/dev/null || return 0
+	if [ -f "$MNT/boot/extlinux/extlinux.conf.bak" ]; then
+		cp -f "$MNT/boot/extlinux/extlinux.conf.bak" "$MNT/boot/extlinux/extlinux.conf" &&
+			say "boot configuration disarmed before the slow part (DEFAULT is the OS again)"
+	fi
+	sync
+	umount "$MNT" 2>/dev/null
+	return 0
 }
 
 find_root_fs() {
@@ -64,6 +114,76 @@ find_root_fs() {
 		note "no partitions visible at all (/sys/class/block): is the disk driver loaded?"
 	fi
 	return 1
+}
+
+extend_partition() { # $1 = partition node; prints same|grown|reboot|manual on stdout
+	# A medium flashed as a plain image copy carries the image's own table: p1 is
+	# image-sized and the filesystem already fills it, so the comparison the OS can
+	# make - filesystem against its partition - finds nothing to do, and nothing
+	# else looks at the disk. The disk is what has the room, and this is the only
+	# context that can act on it: nothing is mounted from the card here, so the
+	# table can be re-read after the write.
+	name=$(basename "$1")
+	start=$(cat "/sys/class/block/$name/start" 2>/dev/null)
+	pcount=$(cat "/sys/class/block/$name/size" 2>/dev/null)
+	if [ -z "${start:-}" ] || [ -z "${pcount:-}" ]; then
+		note "no start/size in sysfs for $name: leaving the table alone"
+		echo manual
+		return 0
+	fi
+	disk=$(mbr_whole_disk_of "$name")
+	dsize=$(cat "/sys/class/block/$disk/size" 2>/dev/null)
+	if [ -z "${dsize:-}" ]; then
+		note "no size known for /dev/$disk: leaving the table alone"
+		echo manual
+		return 0
+	fi
+	after=$((start + pcount))
+	next=$(mbr_next_start "/dev/$disk" "$start")
+	if [ -n "$next" ]; then
+		end=$next
+	else
+		end=$dsize
+	fi
+	if [ "$end" -le "$after" ]; then
+		note "the partition already reaches the end of the disk it can use ($((dsize / 2048)) MiB)"
+		echo same
+		return 0
+	fi
+	slot=$(mbr_slot_of_start "/dev/$disk" "$start")
+	if [ -z "${slot:-}" ]; then
+		note "no MBR entry starts at sector $start: leaving the table alone"
+		echo manual
+		return 0
+	fi
+	new=$((end - start))
+	note "extending $name from $((pcount / 2048)) MiB to $((new / 2048)) MiB of $((dsize / 2048)) MiB"
+	fslog "extending $name from $((pcount / 2048)) MiB to $((new / 2048)) MiB of $((dsize / 2048)) MiB"
+	mbr_write_count "/dev/$disk" "$slot" "$new"
+	sync
+	read -r _ _ got <<EOF
+$(mbr_entry "/dev/$disk" "$slot")
+EOF
+	if [ "${got:-0}" != "$new" ]; then
+		note "the new count did not read back (got ${got:-nothing}, wanted $new)"
+		echo manual
+		return 0
+	fi
+	# Nothing is mounted from this disk, so the kernel can be asked to re-read the
+	# table. When it will not, the resize can only reach the old size and one more
+	# boot finishes the job - which the OS arms by itself, since the filesystem is
+	# then smaller than its partition.
+	if command -v blockdev >/dev/null 2>&1 && blockdev --rereadpt "/dev/$disk" 2>/dev/null; then
+		now=$(cat "/sys/class/block/$name/size" 2>/dev/null)
+		if [ "${now:-0}" -ge "$new" ]; then
+			note "$name is $((now / 2048)) MiB to the kernel now"
+			echo grown
+			return 0
+		fi
+		note "the kernel still reports ${now:-?} sectors for $name"
+	fi
+	echo reboot
+	return 0
 }
 
 sample_writes() { # progress for a resize that prints nothing until it is done
@@ -111,27 +231,67 @@ restore_and_reboot() { # $1 = reason; the boot configuration is what makes this 
 
 say "grow-rootfs: cold resize of the filesystem labelled $LABEL"
 
+# The mmc layer is not up the instant this initramfs starts: the controllers probe
+# asynchronously and the partition scan runs after that, so /sys/class/block can hold
+# no partition node at all for the first seconds of this mode's life. Looking once, at
+# t+3s, is how this mode reported "no ext4 filesystem labelled rootfs on any
+# partition" on a disk that was sitting right there - the same premature look that
+# refused a flash three seconds in, since fixed with a wait there. Wait here too, and
+# say what was actually visible when it gives up.
+waited=0
+while [ "$waited" -lt 20 ]; do
+	for d in /sys/class/block/*; do
+		[ -f "$d/partition" ] && break 2
+	done
+	waited=$((waited + 1))
+	sleep 1
+done
+if [ "$waited" -gt 0 ]; then
+	say "partition nodes appeared after ${waited}s"
+fi
+found=0
+for d in /sys/class/block/*; do
+	[ -f "$d/partition" ] && found=1 && break
+done
+[ "$found" = 1 ] ||
+	note "no partition node after ${waited}s; /sys/class/block holds: $(ls /sys/class/block 2>/dev/null | tr '\n' ' ')"
+
 DEV=$(find_root_fs) || restore_and_reboot "no ext4 filesystem labelled $LABEL on any partition"
 say "filesystem: $DEV, partition $(($(cat "/sys/class/block/$(basename "$DEV")/size" 2>/dev/null) * 512 / 1048576)) MiB"
+fslog "--- grow-rootfs run: $DEV, at uptime $(cat /proc/uptime | awk '{ printf "%d", $1 }')s ---"
+restore_boot_config
+
+# ---------------------------------------------------------- the partition first
+# The partition comes before the filesystem because both need the card untouched,
+# and this is the only context where the table can be written and re-read.
+case "$(extend_partition "$DEV")" in
+reboot)
+	say "the table is written; the kernel will only see it after a reboot"
+	restore_and_reboot "partition extended, the resize follows on the next grow boot"
+	;;
+manual)
+	say "leaving the partition alone and growing the filesystem into it as it is"
+	;;
+esac
 
 # ------------------------------------------------------------------- the work
-say "e2fsck -f on the unmounted filesystem"
+milestone "e2fsck -f on the unmounted filesystem"
 e2fsck -f -y "$DEV" >> "$LOG" 2>&1
 E2RC=$?
 # 0 = clean, 1 = repaired. 2 or worse means there is something here a resize must
 # not be built on top of, and the box is better off booting the OS and saying so.
-say "e2fsck exit $E2RC (0 clean, 1 repaired, 2+ needs attention)"
+milestone "e2fsck exit $E2RC (0 clean, 1 repaired, 2+ needs attention)"
 if [ "$E2RC" -ge 2 ]; then
 	tail -20 "$LOG"
 	restore_and_reboot "e2fsck cannot make $DEV safe (exit $E2RC)"
 fi
 
 sample_writes "$DEV"
-say "resize2fs $DEV"
+milestone "resize2fs $DEV"
 resize2fs "$DEV" >> "$LOG" 2>&1
 RC=$?
 [ -n "$SAMPLER" ] && kill "$SAMPLER" 2>/dev/null
-say "resize2fs exit $RC"
+milestone "resize2fs exit $RC"
 
 # -------------------------------------------------------------------- results
 blocks=$(tune2fs -l "$DEV" 2>/dev/null | awk '/^Block count:/ { print $3; exit }')

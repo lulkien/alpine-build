@@ -1,5 +1,6 @@
 #!/sbin/openrc-run
-# Arm one grow boot when the root filesystem is smaller than its partition.
+# Arm one grow boot when the root filesystem is smaller than its partition, or when
+# the partition is smaller than the disk (a medium installed as a plain image copy).
 #
 # This service used to grow the filesystem itself, with resize2fs on the mounted
 # root. That wedges this board: the online path commits through the kernel's
@@ -29,6 +30,12 @@ BAK=$CONF.bak
 INITRD=/boot/ram-initramfs.gz
 ATTEMPTS=/var/lib/growfs/attempts
 MAX_ATTEMPTS=2
+
+# Partition-table reads, shared with the RAM modes that do the writing (grow mode
+# extends the partition, this script only ever decides): one source, so the two
+# cannot drift on what "there is room" means.
+# shellcheck source=/dev/null
+. /usr/lib/solovox/mbr.sh
 
 depend() {
 	after root localmount
@@ -66,9 +73,34 @@ start() {
 	}
 	fs_bytes=$((fs_blocks * fs_bsize))
 
-	if [ "$fs_bytes" -ge "$part_bytes" ]; then
-		eend 0 "already filling the partition ($((part_bytes / 1048576)) MiB)"
+	# Two different kinds of room can be the reason to arm a grow boot, and saying
+	# which one it is is the difference between a five-minute fix and an evening:
+	# the filesystem can be smaller than its partition (what the online resize used
+	# to handle right here), or the partition can be smaller than the disk - what a
+	# medium installed as a plain image copy looks like, where the filesystem
+	# already fills its partition and nothing running from it can see the rest. The
+	# partition's usable end stops at the next partition's start, so a partition
+	# after the root one is never grown over.
+	disk=$(mbr_whole_disk_of "$(basename "$dev")")
+	disk_sectors=$(cat "/sys/class/block/$disk/size" 2>/dev/null)
+	start_sector=$(cat "/sys/class/block/$(basename "$dev")/start" 2>/dev/null)
+	next_start=$(mbr_next_start "/dev/$disk" "${start_sector:-0}")
+	if [ -n "$next_start" ]; then
+		usable_end=$next_start
+	else
+		usable_end=${disk_sectors:-$sectors}
+	fi
+	room_bytes=$(( (usable_end - ${start_sector:-0}) * 512 ))
+
+	if [ "$fs_bytes" -ge "$part_bytes" ] && [ "$part_bytes" -ge "$room_bytes" ]; then
+		eend 0 "nothing to grow: the filesystem fills its partition and the partition fills the disk ($((part_bytes / 1048576)) MiB of $((disk_sectors / 2048)) MiB)"
 		return 0
+	fi
+
+	if [ "$fs_bytes" -lt "$part_bytes" ]; then
+		einfo "the filesystem ($((fs_bytes / 1048576)) MiB) is smaller than its partition ($((part_bytes / 1048576)) MiB)"
+	else
+		einfo "the partition ($((part_bytes / 1048576)) MiB) is smaller than the disk ($((disk_sectors / 2048)) MiB)"
 	fi
 
 	# There is room. Everything the grow boot needs has to be in this image.
@@ -103,7 +135,7 @@ start() {
 		return 1
 	fi
 
-	ebegin "arming one grow boot: $((fs_bytes / 1048576)) MiB -> $((part_bytes / 1048576)) MiB (attempt $((attempts + 1)) of $MAX_ATTEMPTS)"
+	ebegin "arming one grow boot: $((fs_bytes / 1048576)) MiB filesystem, $((part_bytes / 1048576)) MiB partition, disk usable to $((usable_end / 2048)) MiB (attempt $((attempts + 1)) of $MAX_ATTEMPTS)"
 	cp -f "$CONF" "$BAK" || {
 		eend 1 "cannot write $BAK"
 		return 1

@@ -29,7 +29,14 @@ alpine_minirootfs_sha256 = "821565fa8f3953eefd12497b166b4b50add2f7c57fb312e75862
 # Image identity. The file name is assembled from these plus the machine and the
 # kernel version: <image_prefix>-<machine>-<alpine_release>-<kernel>.
 image_prefix = "alpine"
-image_size_mb = 4096
+# MiB the image holds. Not a comfortable round number: the image only has to carry
+# the rootfs until the filesystem is grown to the card on the first boot, and
+# everything it leaves unmapped is work for the flasher - a sparse write has to
+# read and hash those blocks to prove they are zero first, and a full write writes
+# them. So: rootfs + headroom, and stage 04 refuses a rootfs that does not fit with
+# 256 MiB to spare, which makes a fatter profile a build failure instead of an
+# rsync that runs out of space halfway through.
+image_size_mb = 1536
 disk_id = "abcd1234"
 root_partuuid = "abcd1234-01"
 rootfs_uuid = "9f1c7a3e-5b21-4f8d-9a1c-7b2d4e6f8a90"

@@ -57,6 +57,10 @@ runtime/root/usr/sbin/ota-flash                -> /usr/sbin/ota-flash
 runtime/root/etc/init.d/growfs                 -> /etc/init.d/growfs
 runtime/root/etc/runlevels/default/growfs      -> a real symlink, enabled at boot
 runtime/root/root/.ssh/authorized_keys         -> /root/.ssh/authorized_keys
+runtime/root/usr/lib/solovox/mbr.sh            -> /usr/lib/solovox/mbr.sh, and
+                                                  copied into the RAM initramfs as
+                                                  /bin/mbr.sh (the modes write the
+                                                  table, this side only reads it)
 runtime/initramfs/init                         -> /init in the RAM initramfs
 runtime/initramfs/bin/bmap-write               -> /bin/bmap-write there
 runtime/initramfs/bin/grow-rootfs              -> /bin/grow-rootfs there, and the
@@ -92,7 +96,7 @@ Two things a tree cannot express, both explicit:
 | `overlays` | no | our `.dtso` sources, merged into `boot_dtb` in order |
 | `merge_check_node`, `merge_check_text` | no | the assertion that the merge landed: that node must contain that text in the decompiled result |
 | `alpine_branch`, `alpine_release`, `alpine_mirror`, `alpine_minirootfs_sha256` | yes (common) | the rootfs to bootstrap |
-| `image_prefix`, `image_size_mb` | yes (common) | the image is `<image_prefix>-<platform>-<alpine_release>-<kernel>` |
+| `image_prefix`, `image_size_mb` | yes (common) | the image is `<image_prefix>-<platform>-<alpine_release>-<kernel>`; the size is MiB the image holds, i.e. the rootfs plus headroom, asserted in stage 04 |
 | `disk_id`, `root_partuuid`, `rootfs_uuid` | yes (common) | MBR id, kernel `root=`, filesystem UUID |
 | `timezone` | no | the image's clock |
 | `private_files` | no | runtime files that must be `0600` |
