@@ -10,8 +10,8 @@ is what upstream calls this hardware family.
 ## Result
 
 ```
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img        4.0 GiB raw SD/eMMC image
-image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 719f9ecfcf6a7b71083d8cb650ba91ead3d349d99e1760aba5550001adc2e47a
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img        1536 MiB raw SD/eMMC image
+image/alpine-solovox-z8pro-3.22.6-6.18.53.img.sha256 its digest, written beside the image by stage 04
 ```
 
 Flash it whole to an SD card (or later to eMMC); it contains the bootloader,
@@ -153,13 +153,17 @@ writeback inside the image being written, and the flasher's own executables were
 read back from the blocks `dd` was overwriting.
 
 Flash mode sequence (`board/common/runtime/initramfs/init`, which dispatches between
-the two modes): read the `ota_*` parameters from the kernel command line, wait for
-the target device to appear, bring `eth0` up, fetch the bmap, stream the `.gz`
-through gzip writing only the mapped ranges, verify every range by reading it back,
-check the u-boot magic at KiB 8, reboot. The freshly written image has `DEFAULT bsp`,
-so the box comes up in the OS.
+the two modes): read the `ota_*` parameters from the kernel command line, wait for the
+target device, bring `eth0` up and take a DHCP lease, check the published sidecars
+against what was armed, fetch the bmap, put the boot configuration back when the target
+is not the disk holding it, prove the target is zero where the image is, stream the
+`.gz` through gzip writing only the mapped ranges, verify every range by reading it
+back, check the u-boot magic at KiB 8, extend the root partition to fill the card, make
+the kernel re-read the table it just wrote, flush the cache the write left behind, save
+the attempt's log where the installed OS will find it, reboot. The freshly written
+image has `DEFAULT bsp`, so the box comes up in the OS.
 
-Four details of that sequence carry the design:
+Eight details of that sequence carry the design:
 
 - **The device wait.** devtmpfs is mounted early, but the mmc controllers probe
   asynchronously and the eMMC runs 8-bit tuning before registering, so its node
@@ -188,6 +192,18 @@ Four details of that sequence carry the design:
   the OS running at 17 MB/s with no stalls at all. **Do not power-cycle it while it is
   grinding**: the run is not lost, the resize is simply slow, and a reset in the middle
   costs the whole attempt.
+- **The partition node the write created.** On a blank target the kernel never had a
+  partition table to read, so it made no partition node at all: `$OTA_ROOTPART` does not
+  exist on this boot, and the attempt's record cannot be written where the installed OS
+  looks for it. The write creates that table, so the init makes the kernel re-read it
+  (`blockdev --rereadpt`, with nothing mounted on the target — asserted just before the
+  write) and waits up to 10 s for devtmpfs to publish the node.
+- **The write line reports the write, not the plan.** Progress comes from the target's
+  own write counter, and the last line used to print the planned total as "written"
+  whatever had happened — so a failed write announced `100%` and then, two lines later,
+  that it had failed. The line now claims completion only when the writer exited zero;
+  otherwise it reports what the counter gained before the stream ended,
+  `[write] FAILED: 12/1100 MiB written before the stream ended`.
 - **A target on another disk.** `ota-flash` derives its target from the disk holding
   `/` and will not take another; a hand-armed label may (`ota_target=/dev/mmcblk1`,
   flashing the eMMC from the SD). When the target is not the disk the boot
@@ -200,7 +216,12 @@ Four details of that sequence carry the design:
   to `/var/log/flash-attempt.log` on the partition named by `ota_rootpart`. A failure
   that only ever appeared on the HDMI console is readable afterwards from the
   installed system; on success the file lands in the freshly written image's own
-  filesystem.
+  filesystem. That partition is usually the one this boot just wrote, and its blocks are
+  then the buffer cache's pre-write copy of the medium, so the mount is retried once
+  after `blockdev --flushbufs`; a mount that still fails says so, error string and all,
+  instead of silently dropping the record — a successful flash that left no log is
+  exactly what that silence bought. A partition node that does not exist on this boot is
+  reported the same way, and the record stays on the console only.
 
 Recovery, and the two outcomes are different:
 
@@ -272,9 +293,10 @@ ours to `bmaptool` fails outright). Measured against this writer on the same
 target, bmaptool was not faster, and Alpine has no bmaptool package for the
 initramfs anyway, so the bmap stays ours.
 
-The map skips roughly two thirds of the image, so flash mode writes about 1.1 GiB
-instead of all of it. Unmapped blocks are never written and the image is zero there,
-so the target must already hold zeros outside the mapped ranges. A card that
+The map holds one range per run of non-zero blocks, so flash mode writes what the
+image holds and skips the rest: about 1.1 GiB of the headless image's 1.5 GiB, in
+366 ranges. Unmapped blocks are never written and the image is zero there, so the
+target must already hold zeros outside the mapped ranges. A card that
 already held a different image does not: its old bytes survive in those gaps and
 the result is a disk that is not the image it claims to be, verified ranges and
 all. Flash mode therefore checks the gaps *before* it writes anything, and
@@ -328,10 +350,30 @@ nothing for grow mode to do.
 
 `tests/qemu-flash-mode.sh` exercises both paths for real without the board. It
 boots the image's own kernel and initramfs on QEMU's `virt` machine with a disk
-file as `ota_target` and an HTTP server standing in for the NAS, then checks that
-a successful flash leaves the target byte-identical to the image, and that an
-abort before the first byte restores the boot configuration from the backup and
-leaves the rest of the target untouched.
+file as `ota_target` and an HTTP server standing in for the NAS, and runs three
+cases. 1: a successful flash leaves the boot area byte-identical to the image and
+the whole target differing from it only by the record the guest left (well under a
+MiB), and that record is there. 2: an abort before the first byte restores the boot
+configuration from the backup, leaves the rest of the target untouched, and leaves
+a record of its own. 3: a stream that dies mid-write reports the write as failed
+and never claims 100%. The guest fetches the compressed artifact and the sidecars,
+as the board does — a bare `.img` dies in the guest's gzip — and the harness makes
+that set from the current image when it is missing or older. `BOOTDIR=` points it
+at a candidate initramfs, so one can be tried without rebuilding the image that
+carries it. The container body lives in `tests/qemu-flash-mode-body.sh`: as one
+single-quoted shell argument it silently lost every line containing an apostrophe,
+and `bash -n` cannot see that, because the quote count still balances.
+
+`tests/qemu-flash-other-target.sh` covers the two-disk shape of the same mode: the
+boot configuration on one virtio disk (armed, its backup beside it) and an all-zero
+target on the other — flashing the eMMC from the SD, the case `ota-flash` refuses by
+design and a hand-armed label allows. It checks that the boot disk is back on the
+installed system before the slow part and that the target still matches the image.
+
+`tests/qemu-disk-probe.sh` is a debug helper rather than a test: it boots a minimal
+initramfs with one virtio disk and answers whether sparse writes from a pipe and
+from a file land on the device, printing the device from inside the guest and
+dumping the host-side file afterwards.
 
 `tests/qemu-grow-mode.sh` covers grow mode without the board, in the two shapes it
 has to handle: `fs`, where only the filesystem is small, and `dd`, where the
@@ -342,13 +384,15 @@ everything the disk allows, restored the boot configuration from
 `dd` case also asserts the partition table the guest wrote and re-read.
 
 `tests/qemu-flash-small.sh` runs the same chain against a 16 MiB fixture in
-seconds, which is the one to run on every change. Its target is larger than the
-fixture on purpose, so the partition extension runs for real; the reference is
-patched with the same 4 bytes before the comparison, and the harness reads the
-target's partition entry back to confirm what the guest wrote. `POISON=1` fills
-the target with random bytes first, so the gap check has to refuse: the write
-never starts, the boot configuration is restored, and the installed system stays
-intact.
+seconds, which is the one to run on every change. It and the other-target test
+read a prepared `/tmp/otasrv` fixture — `test.img` with its `.gz`, `.sha256` and
+`.size`, a small hand-made image — and build the bmap for their own copy of it.
+Its target is larger than the fixture on purpose, so the partition extension runs
+for real; the reference is patched with the same 4 bytes before the comparison,
+and the harness reads the target's partition entry back to confirm what the guest
+wrote. `POISON=1` fills the target with random bytes first, so the gap check has
+to refuse: the write never starts, the boot configuration is restored, and the
+installed system stays intact.
 
 ## Growing the root filesystem (cold, from RAM)
 
@@ -406,10 +450,11 @@ even when the filesystem is unclean, and replays no journal.
 Flash mode follows the same rule for the same reason: it disarms the boot
 configuration immediately before the write. Every refusal has already happened by
 then, so writing the boot partition cannot turn a refusal into a write — and it
-rewrites a block the image already fills, so the target still ends up byte for byte
-the image. Its log deliberately does *not* go out at that point: a fresh log block
-would land in a gap no sparse write touches, and then the target would differ from the
-image. It goes out at each exit instead.
+rewrites a block the image already fills, so the write still puts down exactly the
+image. The record deliberately stays out of that step: a fresh log block would land
+in a gap no sparse write touches. It goes out at each exit instead — on a successful
+flash, into the filesystem that was just written, which is the one difference the
+test allows between the target and the image.
 
 ### Provisioning a spare medium from the OS
 

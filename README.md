@@ -3,7 +3,7 @@
 Alpine Linux SD/eMMC image for the Solovox Z8Pro, an X98H-clone Allwinner H618
 TV box.
 
-Builds a 4 GiB raw image (u-boot + BSP kernel + Alpine 3.22 rootfs) entirely on
+Builds a 1.5 GiB raw image (u-boot + BSP kernel + Alpine 3.22 rootfs) entirely on
 an x86_64 host: no root, no card reader, no cross toolchain — a qemu binfmt
 chroot bootstraps the rootfs and a privileged container assembles the image.
 
