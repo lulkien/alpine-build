@@ -299,7 +299,7 @@ say "superblock block count now: ${blocks:-unknown}"
 
 mkdir -p /mnt
 if mount -t ext4 "$DEV" /mnt 2>/dev/null; then
-	say "mounted: $(df -h /mnt 2>/dev/null | awk 'NR == 2 { print $2 " total, " $4 " free }')"
+	say "mounted: $(df -h /mnt 2>/dev/null | awk 'NR == 2 { print $2 " total, " $4 " free" }')"
 	[ -d /mnt/var/log ] || mkdir -p /mnt/var/log
 	echo "--- grow-rootfs run ($(date -u +%Y-%m-%dT%H:%M:%SZ), resize2fs exit $RC) ---" >> /mnt/var/log/grow.log
 	cat "$LOG" >> /mnt/var/log/grow.log
