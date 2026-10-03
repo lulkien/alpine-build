@@ -10,7 +10,10 @@ the same strictness applies to each:
                                                   fetched, built and packaged
 
 The build scripts stay shell — they mount, chroot, apk, losetup and dd — but
-they do not parse TOML: they run this tool first and consume its output.
+they do not parse TOML: they run this tool first and consume its output. The
+entry point (build.py) goes further and imports this module, so the board and
+the profile reach it as data rather than as text to parse back out; `--emit env`
+still exists for the stage containers, which have no python3 of their own.
 
     tools/buildcfg.py profile show simple-graphics --emit env > build/profile.env
     . build/profile.env          # PROFILE_APK_ADD=( ... ) and friends

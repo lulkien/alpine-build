@@ -614,8 +614,10 @@ checks.
 # 0. download + verify inputs (u-boot, minirootfs, ophub kernel release)
 bash scripts/00-fetch-inputs.sh
 
-# sanity check the profiles and recipes (host python3, no docker)
-tests/buildcfg.sh
+# sanity check the profiles, recipes and board (host python3, no docker):
+# pytest for the resolver, bash for the emitted env
+python3 -m pytest tests/test_buildcfg.py -q
+bash tests/buildcfg-env.sh
 
 # 1. Alpine aarch64 rootfs: only what the build needs, native apk in a qemu chroot
 docker run --rm --privileged -v "$PWD":/work debian:trixie \
@@ -694,7 +696,16 @@ installed, every removal absent, every service shipped and enabled, and the
 `mainline` extlinux entry present only when `linux-lts` actually is. A profile is
 validated before any of that — unknown keys, a name that does not match the file,
 a removal that removes nothing, a service whose init script does not exist are all
-build errors (`tests/buildcfg.sh`).
+build errors (`tests/test_buildcfg.py`).
+
+That suite is split in two, and `python3 build.py` runs both. The resolver's own
+behaviour is pytest: `tests/test_buildcfg.py` calls `tools/buildcfg.py` in
+process, so the fixtures live a directory swap away instead of a subprocess
+(`sudo apt install python3-pytest`, then `python3 -m pytest
+tests/test_buildcfg.py -q`). What pytest cannot check is the other half of the
+contract — that `--emit env` is *valid bash*, and that a value containing spaces
+survives the `eval` the stage scripts do — so those assertions stay in bash:
+`tests/buildcfg-env.sh`. `--no-tests` skips both.
 
 Software that is not in the Alpine mirrors is a recipe; see
 [docs/recipes.md](recipes.md).

@@ -31,8 +31,9 @@ The stages themselves are shell (scripts/00-05): they mount, chroot, apk,
 losetup and dd, and their code is the command lines. This file orders them.
 
 Requirements: docker (with the daemon reachable), qemu-aarch64 binfmt for the
-chroot stage, and python3 >= 3.11 on the host (tomllib). Roughly two minutes end
-to end on a warm cache.
+chroot stage, python3 >= 3.11 on the host (tomllib), and pytest for the
+profiles-and-recipes suite (--no-tests skips it). Roughly two minutes end to end
+on a warm cache.
 """
 
 from __future__ import annotations
@@ -72,9 +73,9 @@ def run(argv: list[str], **kwargs) -> None:
 def capture(argv: list[str]) -> str:
     """Run a command, return its stdout, its stderr still on the terminal.
 
-    The pipeline this replaces (`bash tests/buildcfg.sh | tail -1`) relied on
-    `set -o pipefail` to fail the build when the checks failed; the return code
-    is checked here instead, and only the last line is printed as build.sh did.
+    The return code is checked rather than trusted: a suite that fails prints a
+    report and may still exit 0 through a pipe, and a build that ran the checks
+    only to wave them through is worse than one that skips them (--no-tests).
     """
     proc = subprocess.run(argv, stdout=subprocess.PIPE, text=True)
     if proc.returncode != 0:
@@ -146,7 +147,18 @@ def main(argv: list[str] | None = None) -> int:
     # Cheap and offline: catches a broken profile or recipe before any container
     if args.run_tests:
         stage("profiles and recipes")
-        print(capture(["bash", "tests/buildcfg.sh"]).strip().splitlines()[-1])
+        # The suite is two halves: the resolver's behaviour is pytest
+        # (tests/test_buildcfg.py), and the shell contract - the emitted env is
+        # valid bash and a value with spaces survives eval - stays bash
+        # (tests/buildcfg-env.sh), because python cannot source a shell
+        # fragment. Each prints its own verdict as its last line.
+        try:
+            import pytest  # noqa: F401
+        except ImportError:
+            die("pytest is not installed (sudo apt install python3-pytest)")
+        print(capture(["bash", "tests/buildcfg-env.sh"]).strip().splitlines()[-1])
+        print(capture([sys.executable, "-m", "pytest",
+                       "tests/test_buildcfg.py", "-q"]).strip().splitlines()[-1])
 
     # --- recipes ------------------------------------------------------------
     # Only a profile that names recipes pays for this: headless has none.
