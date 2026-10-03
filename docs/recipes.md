@@ -11,7 +11,8 @@ profiles/simple-graphics.toml              names it: recipes = [ "..." ]
 tools/buildcfg.py                          validates and resolves both
 tools/mkapk.sh                             DESTDIR tree -> signed .apk
 scripts/01-build-recipes.sh                fetch, build in a chroot, package
-tests/buildcfg.sh                          format checks, no board required
+tests/test_buildcfg.py                     format and resolution checks, no board
+tests/buildcfg-env.sh                      the emitted env is valid bash
 tests/recipe-build.sh                      the whole recipe path, offline
 ```
 
@@ -201,7 +202,8 @@ packages/              the built .apk files
    value, or copy it from the checkout you have tested.
 3. Add the name to `recipes = [ ... ]` in the profile that should carry it, and
    add any OpenRC service it ships to `services = [ ... ]` in the same profile.
-4. Run `tests/buildcfg.sh`.
+4. Run `python3 -m pytest tests/test_buildcfg.py -q` and
+   `bash tests/buildcfg-env.sh`.
 5. Bumping means editing `ref` (and `version` when upstream released) — a recipe
    in the image manifest is what makes an installed box auditable later.
 
