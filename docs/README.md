@@ -548,7 +548,7 @@ The board layer lives here: `board/common/` is what every machine shares (the
 Alpine release, the image naming and IDs, and the runtime files that ship in the
 image), and `board/platform/<name>/` is one machine (its kernel and u-boot pins,
 its devicetree, its hostname). `tools/buildcfg.py` resolves the pair into
-`build/board.env` for the stage scripts, and `build.sh --board <name>` picks the
+`build/board.env` for the stage scripts, and `build.py --board <name>` picks the
 machine. The runtime trees mirror their destinations, so a file's path in
 `board/common/runtime/root/` is its path on the board; compiled devicetrees go to
 `build/devicetree/`, never into the tree. See [docs/board.md](board.md).
@@ -590,10 +590,13 @@ Two things about it matter for the build:
 One command does the whole thing:
 
 ```bash
-bash build.sh                              # headless, the default profile
-bash build.sh --profile simple-graphics    # mesa userspace + the sgc daemon
-bash build.sh --clean --no-tests           # wipe the rootfs first, skip the checks
+python3 build.py                           # headless, the default profile
+python3 build.py --profile simple-graphics # mesa userspace + the sgc daemon
+python3 build.py --clean --no-tests        # wipe the rootfs first, skip the checks
 ```
+
+`build.py` is the entry point: it resolves the board and the profile by importing
+`tools/buildcfg.py` (so the host needs python3 ≥ 3.11), then runs the stages.
 
 It runs `00` fetch/verify, the board, profile and recipe checks, `01` for the
 profile's recipes (packages from `recipes/`, skipped when the profile names none),
@@ -603,9 +606,9 @@ its own build time.
 
 The stages below are the same thing spelled out, for running or debugging one of
 them on its own. Inputs are fetched and hash-verified first, then each stage runs
-through a throwaway container so the host needs no extra tooling — only `docker`
-and `qemu-aarch64` binfmt are required (plus `python3` for the profile/recipe
-checks and anything you run by hand).
+through a throwaway container so the host needs no extra tooling — `docker` and
+`qemu-aarch64` binfmt, plus python3 ≥ 3.11 for `build.py` and the profile/recipe
+checks.
 
 ```bash
 # 0. download + verify inputs (u-boot, minirootfs, ophub kernel release)

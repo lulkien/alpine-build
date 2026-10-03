@@ -29,7 +29,7 @@ PACKAGES_DIR="$WORK/packages"
 PROFILE="${PROFILE:-headless}"
 
 # The machine's values are data: board/common/board.toml plus
-# board/platform/<name>/board.toml. build.sh resolves them before the containers
+# board/platform/<name>/board.toml. build.py resolves them before the containers
 # start; doing it again here (python3 is in this container) keeps this stage
 # runnable on its own, and this is the only place build/board.env is written.
 mkdir -p "$BUILDDIR"

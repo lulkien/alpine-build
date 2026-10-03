@@ -10,15 +10,19 @@ chroot bootstraps the rootfs and a privileged container assembles the image.
 Quick start:
 
 ```bash
-bash build.sh                              # the headless image
-bash build.sh --profile simple-graphics    # mesa + the sgc daemon
-bash build.sh --board solovox-z8pro --profile simple-graphics
+python3 build.py                           # the headless image
+python3 build.py --profile simple-graphics # mesa + the sgc daemon
+python3 build.py --board solovox-z8pro --profile simple-graphics
 ```
 
-`build.sh` fetches and verifies the inputs, checks the board, profile and recipe
+`build.py` fetches and verifies the inputs, checks the board, profile and recipe
 definitions, runs the build stages through throwaway containers, and leaves
-`image/alpine-solovox-z8pro-*.img` behind. `bash build.sh --help` lists the
+`image/alpine-solovox-z8pro-*.img` behind. `python3 build.py --help` lists the
 options (`--board`, `--clean`, `--no-tests`, `--skip-fetch`).
+
+The entry point is python because the board and profile definitions are data: it
+imports `tools/buildcfg.py` and reads them as dicts. The stages it runs are still
+shell (`scripts/00`–`05`) — they mount, chroot, apk, losetup and dd.
 
 Then flash `image/*.img` to an SD card and boot it.
 

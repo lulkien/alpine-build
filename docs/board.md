@@ -15,11 +15,11 @@ profiles/essential.toml + a profile that inherits it  the software half
 `tools/buildcfg.py board show <name> --emit env > build/board.env` resolves the
 pair into bash values, which the stage scripts source, and
 `--emit manifest` writes the board lines of `/etc/solovox/image-manifest` (the
-kernel and u-boot pins, which nothing else records). `build.sh` takes
+kernel and u-boot pins, which nothing else records). `build.py` takes
 `--board <name>`, defaulting to the only platform installed:
 
 ```
-bash build.sh --board solovox-z8pro --profile simple-graphics
+python3 build.py --board solovox-z8pro --profile simple-graphics
 ```
 
 ## What is in a platform directory
