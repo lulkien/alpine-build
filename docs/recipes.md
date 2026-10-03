@@ -180,10 +180,10 @@ tools/buildcfg.py recipe show simple-graphics-controller
 scripts/01-build-recipes.sh --profile simple-graphics
 
 # then the image, which installs them and records the commits
-bash build.sh --profile simple-graphics
+python3 build.py --profile simple-graphics
 ```
 
-`build.sh` runs 01 for profiles that name recipes, so the two commands above are
+`build.py` runs 01 for profiles that name recipes, so the two commands above are
 one in practice. 01 keeps its caches under the workspace, all reusable:
 
 ```

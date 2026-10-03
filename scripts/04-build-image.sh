@@ -14,7 +14,7 @@ ROOT="$WORK/rootfs"
 BUILDDIR="$WORK/build"
 IMGDIR="$WORK/image"
 
-# Board data: build/board.env is written by 03 (and by build.sh before any
+# Board data: build/board.env is written by 03 (and by build.py before any
 # container runs). The image name, its size, the disk and filesystem IDs, the
 # kernel release and the devicetree file names all come from there - this stage
 # names none of them itself.

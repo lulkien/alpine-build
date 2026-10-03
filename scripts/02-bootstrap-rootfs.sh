@@ -11,11 +11,11 @@ set -euo pipefail
 
 WORK=/work
 ROOT="$WORK/rootfs"
-# The Alpine release is board data (board/common/board.toml). build.sh resolved it
+# The Alpine release is board data (board/common/board.toml). build.py resolved it
 # into build/board.env before this container started; this container has no
 # python3, so the file is a hard requirement here.
 [ -f "$WORK/build/board.env" ] || {
-  echo "build/board.env missing: run build.sh (or scripts/00-fetch-inputs.sh) first" >&2
+  echo "build/board.env missing: run build.py (or scripts/00-fetch-inputs.sh) first" >&2
   exit 1
 }
 # shellcheck disable=SC1091

@@ -336,7 +336,7 @@ cat <<EOF
 Packages are installed by stage 03, which copies $KEYDIR/$KEY_NAME into the
 image's /etc/apk/keys so apk treats them as trusted:
 
-  bash build.sh --profile $PROFILE
+  python3 build.py --profile $PROFILE
 
 On the board, /etc/solovox/image-manifest records the commit each package was
 built from.
